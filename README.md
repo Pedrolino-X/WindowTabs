@@ -1,10 +1,12 @@
 # WindowTabs 修复增强版
 
+**简体中文** | [English](README.en.md) | [日本語](README.ja.md)
+
 **把多个 Windows 应用窗口放进同一组标签，用熟悉的点击、拖拽和右键菜单管理它们。**
 
 本分支由 [Pedrolino-X](https://github.com/Pedrolino-X) 维护，基于 standard-software 的 WindowTabs，沿用原版界面和操作流程，重点改善大量窗口下的性能、资源释放和窗口切换稳定性。适合同时打开多个资源管理器、浏览器、办公软件及开发工具窗口的使用场景。
 
-[下载便携版](https://github.com/Pedrolino-X/WindowTabs/releases/latest) · [更新记录](version.md) · [反馈问题](https://github.com/Pedrolino-X/WindowTabs/issues) · [上游操作手册（英文）](README_Upstream.md)
+[下载便携版](https://github.com/Pedrolino-X/WindowTabs/releases/latest) · [更新记录](version.md) · [反馈问题](https://github.com/Pedrolino-X/WindowTabs/issues)
 
 ![WindowTabs 标签分组示意，来自上游](README_Image/Tabs.png)
 
@@ -120,4 +122,4 @@ powershell -ExecutionPolicy Bypass -File .\build-repair.ps1 -Test
 
 本分支基于 [standard-software/WindowTabs](https://github.com/standard-software/WindowTabs) 的 ss_2026.08.28 源码，基础提交为 [`23db51a`](https://github.com/standard-software/WindowTabs/commit/23db51a11a90cdd57377d0ef86a002496163dd78)。原作者为 Maurice Flanagan，感谢 payaneco、leafOfTree、standard-software 及历代贡献者。
 
-保留上游 Git 历史和 [MIT 许可证](LICENSE)。上游英文操作说明保存在 [README_Upstream.md](README_Upstream.md)，上游日文说明保存在 [README_Japanese.md](README_Japanese.md)；本分支当前行为和下载入口以本页为准。
+保留上游 Git 历史和 [MIT 许可证](LICENSE)。
