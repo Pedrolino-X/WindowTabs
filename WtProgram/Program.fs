@@ -197,7 +197,7 @@ type Program() as this =
     // snapshot taken before they closed
     let restoredFromMap = Cell.create(Map2() : Map2<IntPtr, IntPtr>)
     // Temporary storage for tab group configuration (used during disable/enable)
-    let savedTabGroups = Cell.create<List2<List2<IntPtr> * string * bool * List2<IntPtr>>>(List2())
+    let savedTabGroups = Cell.create<List2<List2<IntPtr> * string * bool * List2<IntPtr> * bool>>(List2())
     let windowNameOverride = Cell.create(Map2())
     // Global per-HWND storage for fill color, underline color and pinned state (persists across group transfers)
     let windowFillColor = Cell.create(Map2() : Map2<IntPtr, Color>)
@@ -701,7 +701,7 @@ type Program() as this =
                 // still be at the dragExit off-screen parking location
                 // while their adjustChildWindows hasn't run yet.
                 if window.isOnCurrentVirtualDesktop &&
-                   this.isTabbableWindow(window).not &&
+                   (Services.filter.isRetainableWindow(hwnd)).not &&
                    not (isRecentlyPlaced(hwnd))
                 then
                     // Record only genuinely destroyed windows; a window that is
@@ -731,7 +731,7 @@ type Program() as this =
         let group,isNewGroup =
             match this.findGroupForWindow(window) with
             | Some(group) -> (group, false)
-            | None -> (Services.desktop.createGroup(false), true)
+            | None -> (Services.desktop.createGroup(Services.settings.getValue("combineTaskbarIconsByDefault") :?> bool), true)
         let isDropped = isDroppedAndAwaitingGrouping.value.contains(hwnd)
         DragTrace.log (sprintf "addWindowToGroup: hwnd=%X dropped=%b newGroup=%b" (hwnd.ToInt64()) isDropped isNewGroup)
         //need to add this now so we don't end up creating another group for it while waiting for the WgnWindowAdded notification
@@ -967,7 +967,7 @@ type Program() as this =
                         // Save per-tab alignment from global
                         match windowAlignment.value.tryFind(hwnd) with
                         | Some(a) ->
-                            let alignStr = match a with TopLeft -> "TopLeft" | TopRight -> "TopRight"
+                            let alignStr = match a with TopLeft -> "TopLeft" | TopRight -> "TopRight" | TopCenter -> "TopCenter"
                             windowObj.setString("tabAlignment", alignStr)
                         | None -> ()
                         windowsArray.Add(windowObj)
@@ -978,6 +978,7 @@ type Program() as this =
                     groupObj.setString("tabPosition", gi.perGroupTabPositionValue)
                     // Save per-group snap tab height margin
                     groupObj.setBool("snapTabHeightMargin", gi.snapTabHeightMargin)
+                    groupObj.setBool("combineTaskbarIcons", gi.combineTaskbarIcons)
                     groupsArray.Add(groupObj)
             json.addOrUpdate("SavedTabGroupsForRestart", groupsArray)
             settingsManager.settingsJson <- json
@@ -1008,7 +1009,7 @@ type Program() as this =
                 // For each saved group, find windows by hwnd and recreate the group
                 // Supports both old format (JArray of windows) and new format (JObject with windows + tabPosition)
                 for groupToken in groupsArray do
-                    let windowsArray, savedTabPosition, savedSnapMargin =
+                    let windowsArray, savedTabPosition, savedSnapMargin, savedTaskbarMerge =
                         match groupToken with
                         | :? JObject as groupObj ->
                             // New format: { windows: [...], tabPosition: "TopLeft", snapTabHeightMargin: true }
@@ -1018,11 +1019,11 @@ type Program() as this =
                                 | _ -> JArray()
                             let tabPos = groupObj.getString("tabPosition")
                             let snapMargin = groupObj.getBool("snapTabHeightMargin")
-                            windows, tabPos, snapMargin
+                            windows, tabPos, snapMargin, settingsManager.settings.combineTaskbarIconsByDefault
                         | :? JArray as arr ->
                             // Old format: direct array of window objects
-                            arr, None, None
-                        | _ -> JArray(), None, None
+                            arr, None, None, settingsManager.settings.combineTaskbarIconsByDefault
+                        | _ -> JArray(), None, None, false
 
                     if windowsArray.Count > 0 then
                         // Collect saved window info (hwnd, optional renamedTabName, isPinned, fillColor)
@@ -1041,6 +1042,7 @@ type Program() as this =
                                             match obj.getString("tabAlignment") with
                                             | Some("TopLeft") | Some("Left") -> Some(TopLeft)
                                             | Some("TopRight") | Some("Right") -> Some(TopRight)
+                                            | Some("TopCenter") | Some("Center") -> Some(TopCenter)
                                             | _ -> None
                                         (hwnd, obj.getString("renamedTabName"), isPinned, fillColor, underlineColor, borderColor, tabAlign))
                                 | _ -> None)
@@ -1053,7 +1055,7 @@ type Program() as this =
 
                         // Create group with matched windows (preserving saved order)
                         if matchedWindows.Length >= 1 then
-                            let group = Services.desktop.createGroup(false)
+                            let group = Services.desktop.createGroup(savedTaskbarMerge)
                             matchedWindows |> List.iter (fun (hwnd, renamedTabName, isPinned, fillColor, underlineColor, borderColor, tabAlign) ->
                                 // Restore to global maps BEFORE addWindow to avoid race condition
                                 // (addWindow is async on group thread, which reads from globals)
@@ -1208,19 +1210,32 @@ type Program() as this =
         member x.appWindows =
             os.windowsInZorder.where(this.isAppWindow).map(fun w -> w.hwnd)
 
+        member x.getGroupPreference(exe, key) =
+            settingsManager.settingsJson.getObject("ProgramGroupPreferences").bind(fun rules -> rules.getObject(exe.ToLowerInvariant())).bind(fun rule -> rule.getString(key))
+
+        member x.setGroupPreference(exe, key, value) =
+            let json = settingsManager.settingsJson
+            let rules = json.getObject("ProgramGroupPreferences").def(JObject())
+            let name = exe.ToLowerInvariant()
+            let rule = rules.getObject(name).def(JObject())
+            rule.setString(key,value)
+            rules.setObject(name,rule)
+            json.setObject("ProgramGroupPreferences",rules)
+            settingsManager.settingsJson <- json
+
         member x.getAutoGroupingEnabled procPath =
-            settingsManager.settings.autoGroupingPaths.contains(procPath)
+            not(settingsManager.settings.autoGroupingExcludedPaths.items.any(fun p -> String.Equals(p,procPath,StringComparison.OrdinalIgnoreCase)))
 
         member x.setAutoGroupingEnabled procPath enabled =
             if enabled then
-                this.saveSettingsAndUpdateAppWindows <| fun s -> { s with autoGroupingPaths = s.autoGroupingPaths.add procPath }
+                this.saveSettingsAndUpdateAppWindows <| fun s -> { s with autoGroupingPaths = s.autoGroupingPaths.add procPath; autoGroupingExcludedPaths = Set2(s.autoGroupingExcludedPaths.items.where(fun p -> not(String.Equals(p,procPath,StringComparison.OrdinalIgnoreCase)))) }
                //toggle tabbing for the process to force regrouping
                 Services.filter.setIsTabbingEnabledForProcess procPath false
                 this.refresh()
                 Services.filter.setIsTabbingEnabledForProcess procPath true
                 this.refresh()
             else
-                this.saveSettingsAndUpdateAppWindows <| fun s -> { s with autoGroupingPaths = s.autoGroupingPaths.remove procPath }
+                this.saveSettingsAndUpdateAppWindows <| fun s -> { s with autoGroupingPaths = s.autoGroupingPaths.remove procPath; autoGroupingExcludedPaths = s.autoGroupingExcludedPaths.add procPath }
 
         member x.getCategoryEnabled (procPath, categoryNum) =
             let settingsJson = settingsManager.settingsJson
@@ -1299,7 +1314,7 @@ type Program() as this =
                 // When disabling, save current tab group configuration first (with per-group tab position)
                 let groupConfigs = this.desktop.groups.map <| fun gi ->
                     let pinnedHwnds = gi.visualOrder.where(fun hwnd -> gi.isPinned(hwnd))
-                    (gi.visualOrder, gi.perGroupTabPositionValue, gi.snapTabHeightMargin, pinnedHwnds)
+                    (gi.visualOrder, gi.perGroupTabPositionValue, gi.snapTabHeightMargin, pinnedHwnds, gi.combineTaskbarIcons)
                 savedTabGroups.set(groupConfigs)
 
                 // Set disabled state before destroying groups
@@ -1318,14 +1333,14 @@ type Program() as this =
                 this.isTabMonitoringSuspended <- true
 
                 // Restore saved tab groups
-                savedTabGroups.value.iter <| fun (hwnds, savedTabPos, savedSnapMargin, pinnedHwnds) ->
+                savedTabGroups.value.iter <| fun (hwnds, savedTabPos, savedSnapMargin, pinnedHwnds, savedTaskbarMerge) ->
                     // Filter out windows that no longer exist or are not visible
                     let validHwnds = hwnds.where <| fun hwnd ->
                         let window = os.windowFromHwnd(hwnd)
                         window.isWindow && window.isVisibleOnScreen
 
                     if validHwnds.count > 0 then
-                        let group = Services.desktop.createGroup(false)
+                        let group = Services.desktop.createGroup(savedTaskbarMerge)
                         validHwnds.iter <| fun hwnd ->
                             group.addWindow(hwnd, false)
                         // Restore per-group tab position
@@ -1345,7 +1360,7 @@ type Program() as this =
 
             this.refresh()
 
-        member x.launchNewWindow(groupHwnd)(invokerHwnd)(processPath) =
+        member x.launchNewWindow(groupHwnd)(invokerHwnd)(processPath)(arguments) =
             // Register the pending launch: new window with this process path should dock to this group
             pendingNewWindowLaunches.map(fun m -> m.add processPath (groupHwnd, invokerHwnd, DateTime.Now))
             // Start the process
@@ -1353,11 +1368,14 @@ type Program() as this =
                 let psi = ProcessStartInfo()
                 psi.UseShellExecute <- true
                 psi.FileName <- processPath
-                Process.Start(psi) |> ignore
+                psi.Arguments <- arguments
+                use proc = Process.Start(psi)
+                ()
             with
             | _ ->
                 // If launch fails, remove the pending entry
                 pendingNewWindowLaunches.map(fun m -> m.remove processPath)
+                reraise()
 
         member x.launchStandaloneWindow(processPath)(postAction) =
             // Register the pending launch: the new window must land in its own fresh group
@@ -1380,6 +1398,7 @@ type Program() as this =
             settings.excludedPaths.items.iter(fun p -> paths.Add(p) |> ignore)
             // Collect from autoGroupingPaths
             settings.autoGroupingPaths.items.iter(fun p -> paths.Add(p) |> ignore)
+            settings.autoGroupingExcludedPaths.items.iter(fun p -> paths.Add(p) |> ignore)
             // Collect from Category1Paths through Category10Paths
             let settingsJson = settingsManager.settingsJson
             for i in 1..10 do
@@ -1394,7 +1413,8 @@ type Program() as this =
                 { s with
                     includedPaths = s.includedPaths.remove procPath
                     excludedPaths = s.excludedPaths.remove procPath
-                    autoGroupingPaths = s.autoGroupingPaths.remove procPath }
+                    autoGroupingPaths = s.autoGroupingPaths.remove procPath
+                    autoGroupingExcludedPaths = s.autoGroupingExcludedPaths.remove procPath }
             // Remove from Category1-10Paths
             let settingsJson = settingsManager.settingsJson
             for i in 1..10 do

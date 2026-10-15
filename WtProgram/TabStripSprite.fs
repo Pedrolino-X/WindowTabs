@@ -14,7 +14,7 @@ type IconSprite = {
     interface ISprite with
         member this.image =
             let bitmap = Img(this.size)
-            let g = bitmap.graphics
+            use g = bitmap.graphics
             // Fill with near-transparent color so entire icon area is hit-testable
             g.Clear(Color.FromArgb(1, 0, 0, 0))
             try
@@ -27,7 +27,11 @@ type IconSprite = {
                     if this.scale = 1.0 then this.icon
                     else ScaledIcon.at this.icon this.size.width
                 let rect = new Rectangle(0, 0, this.size.width, this.size.height)
-                do g.DrawIcon(icon, rect)
+                // DrawIcon on an image-backed Graphics creates a temporary
+                // bitmap in .NET Framework. Own it explicitly instead of
+                // leaving one native bitmap per tab/frame to the finalizer.
+                use iconBitmap = icon.ToBitmap()
+                do g.DrawImage(iconBitmap, rect)
             with | e -> ()
             bitmap
         member this.children = List2()
@@ -51,7 +55,7 @@ type CloseButtonSprite = {
     interface ISprite with
         member this.image =
             let bitmap = Img(this.size)
-            let g = bitmap.graphics
+            use g = bitmap.graphics
             g.SmoothingMode <- SmoothingMode.AntiAlias
             // Draw rounded rectangle background
             let bgColor = this.bgColor.def(Color.FromArgb(1, 1, 1, 1))
@@ -63,13 +67,15 @@ type CloseButtonSprite = {
             path.AddArc(rect.Right - r * 2, rect.Bottom - r * 2, r * 2, r * 2, 0.0f, 90.0f)
             path.AddArc(rect.X, rect.Bottom - r * 2, r * 2, r * 2, 90.0f, 90.0f)
             path.CloseFigure()
-            g.FillPath(new SolidBrush(bgColor), path)
+            use backgroundBrush = new SolidBrush(bgColor)
+            g.FillPath(backgroundBrush, path)
             // Draw X mark centered on rounded rect
             let cx = float32(this.size.width - 1) / 2.0f
             let cy = float32(this.size.height - 1) / 2.0f
             let half = Dpi.pxf this.scale 4.0f
-            g.DrawLine(this.pen, cx - half, cy - half, cx + half, cy + half)
-            g.DrawLine(this.pen, cx - half, cy + half, cx + half, cy - half)
+            use closePen = this.pen
+            g.DrawLine(closePen, cx - half, cy - half, cx + half, cy + half)
+            g.DrawLine(closePen, cx - half, cy + half, cx + half, cy - half)
             bitmap
         member this.children = List2()
 
@@ -103,7 +109,7 @@ type PinButtonSprite = {
     interface ISprite with
         member this.image =
             let bitmap = Img(this.size)
-            let g = bitmap.graphics
+            use g = bitmap.graphics
             g.SmoothingMode <- SmoothingMode.AntiAlias
             // Draw rounded rectangle background (same as close button)
             let bgColor = this.bgColor.def(Color.FromArgb(1, 1, 1, 1))
@@ -115,7 +121,8 @@ type PinButtonSprite = {
             path.AddArc(rect.Right - r * 2, rect.Bottom - r * 2, r * 2, r * 2, 0.0f, 90.0f)
             path.AddArc(rect.X, rect.Bottom - r * 2, r * 2, r * 2, 90.0f, 90.0f)
             path.CloseFigure()
-            g.FillPath(new SolidBrush(bgColor), path)
+            use backgroundBrush = new SolidBrush(bgColor)
+            g.FillPath(backgroundBrush, path)
             // Draw pin icon
             let color = this.penColor
             use brush = new SolidBrush(color)
@@ -304,7 +311,7 @@ type TabSprite<'id> = {
                 else inactive
         // HAIRLINE, deliberately NOT scaled - see the note above TabSprite.size
         // about the one-device-pixel rule.
-        new Pen(new SolidBrush(color), 1.0f)
+        new Pen(color, 1.0f)
 
     member private this.borderPath =
         let path = new GraphicsPath()
@@ -380,16 +387,18 @@ type TabSprite<'id> = {
     interface ISprite with
         member this.image =
             let img = Img(this.size)
-            let g = img.graphics
+            use g = img.graphics
             // Fill with near-transparent color so entire rectangular area is hit-testable
             // This prevents mouse events from passing through the gap between tab curves
             g.Clear(Color.FromArgb(1, 0, 0, 0))
-            do g.FillPath(this.bgBrush, this.borderPath)
+            use backgroundBrush = this.bgBrush
+            use borderPath = this.borderPath
+            do g.FillPath(backgroundBrush, borderPath)
             // Draw fill color overlay (semi-transparent) between background and text
             match this.displayInfo.fillColor with
             | Some(fillColor) ->
                 let state = g.Save()
-                g.SetClip(this.borderPath)
+                g.SetClip(borderPath)
                 use fillBrush = new SolidBrush(fillColor)
                 g.FillRectangle(fillBrush, Rectangle(0, 0, this.size.width, this.size.height))
                 g.Restore(state)
@@ -399,8 +408,8 @@ type TabSprite<'id> = {
                 //can't be drawn by gdi+ to a transparent background, need to draw directly on the tab background
                 let text = this.displayInfo.text
                 let font = this.displayInfo.textFont
-                let brush = this.tabTextBrush
-                let format = new StringFormat()
+                use brush = this.tabTextBrush
+                use format = new StringFormat()
                 do format.LineAlignment <- StringAlignment.Center
                 do format.Alignment <- StringAlignment.Near
                 do format.Trimming <- StringTrimming.None
@@ -426,7 +435,7 @@ type TabSprite<'id> = {
                             | None -> this.tabBgColor
                         let fadeRect = Rectangle(fadeX, 0, fadeWidth + 1, this.size.height)
                         let state = g.Save()
-                        g.SetClip(this.borderPath)
+                        g.SetClip(borderPath)
                         use fadeBrush = new LinearGradientBrush(
                             fadeRect,
                             Color.FromArgb(0, int bgColor.R, int bgColor.G, int bgColor.B),
@@ -435,13 +444,14 @@ type TabSprite<'id> = {
                         g.FillRectangle(fadeBrush, fadeRect)
                         g.Restore(state)
             // Draw border after text and gradient so border is never affected by fade
-            do g.DrawPath(this.borderPen, this.borderPath)
+            use borderPen = this.borderPen
+            do g.DrawPath(borderPen, borderPath)
             // Draw underline color at bottom/top of tab with gradient (opaque left half, fading to transparent on right)
             match this.displayInfo.underlineColor with
             | Some(underlineColor) ->
                 let underlineHeight = this.px 3
                 let state = g.Save()
-                g.SetClip(this.borderPath)
+                g.SetClip(borderPath)
                 let y =
                     match this.direction with
                     | TabUp -> this.size.height - underlineHeight
@@ -469,11 +479,11 @@ type TabSprite<'id> = {
                 // Draw the tab shape border (top and sides): the same
                 // one-device-pixel hairline as borderPen, so a coloured tab
                 // outline and an uncoloured one have identical weight.
-                use shapePen = new Pen(new SolidBrush(borderColor), 1.0f)
-                g.DrawPath(shapePen, this.borderPath)
+                use shapePen = new Pen(borderColor, 1.0f)
+                g.DrawPath(shapePen, borderPath)
                 // Draw bottom/top edge using same logic as underline (SetClip + FillRectangle + gradient)
                 let underlineHeight = this.px 3
-                g.SetClip(this.borderPath)
+                g.SetClip(borderPath)
                 let y =
                     match this.direction with
                     | TabUp -> this.size.height - underlineHeight
@@ -616,6 +626,9 @@ type TabStripSprite<'id> when 'id : equality = {
     // Uses Chrome-style tab overlap so the rendered group matches the
     // visual spacing of normal (non-dragged) tabs.
     member private this.dragGroupOffsetOf (tab: 'id) : float =
+        this.dragGroupOffsetWithLengths this.tabLengths tab
+
+    member private this.dragGroupOffsetWithLengths (pinned, unpinned) (tab: 'id) : float =
         match this.dragGroupPivot with
         | None -> 0.0
         | Some pivot ->
@@ -627,7 +640,7 @@ type TabStripSprite<'id> when 'id : equality = {
                 let mutable offset = 0.0
                 for i in pIdx .. tIdx - 1 do
                     let t = this.dragGroup.[i]
-                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    let tLen = if this.isPinned(t) then pinned else unpinned
                     offset <- offset + tLen - this.tabOverlap
                 offset
             else
@@ -635,24 +648,32 @@ type TabStripSprite<'id> when 'id : equality = {
                 let mutable offset = 0.0
                 for i in tIdx .. pIdx - 1 do
                     let t = this.dragGroup.[i]
-                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    let tLen = if this.isPinned(t) then pinned else unpinned
                     offset <- offset - (tLen - this.tabOverlap)
                 offset
 
     member private this.calcGroupWidth (tabs: List2<'id>) =
         if tabs.isEmpty then 0.0
         else
+            let pinned, unpinned = this.tabLengths
             let totalLen =
                 tabs.list |> List.sumBy (fun t ->
-                    if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+                    if this.isPinned(t) then pinned else unpinned)
             totalLen - float(tabs.length - 1) * this.tabOverlap
 
+    member private this.centerStart(width, leftWidth, rightWidth) =
+        let ideal = (float(this.size.width) - width) / 2.0
+        let low = max 0.0 (leftWidth - this.tabOverlap)
+        let high = float(this.size.width) - width - max 0.0 (rightWidth - this.tabOverlap)
+        max low (min ideal high)
+
     member private this.tabOffsetInGroup (tabs: List2<'id>) (tab: 'id) =
+        let pinned, unpinned = this.tabLengths
         let idx = tabs.list |> List.findIndex ((=) tab)
         tabs.list
         |> Seq.take idx
         |> Seq.fold (fun acc t ->
-            let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+            let tLen = if this.isPinned(t) then pinned else unpinned
             acc + tLen - this.tabOverlap
         ) 0.0
 
@@ -660,14 +681,15 @@ type TabStripSprite<'id> when 'id : equality = {
         if tabs.isEmpty then None
         else
             let relX = x - groupStartX
-            let tabList = tabs.list
+            let tabList = tabs.list |> List.toArray
+            let pinned, unpinned = this.tabLengths
             let mutable offset = 0.0
-            let mutable result = tabList |> List.last
+            let mutable result = tabList.[tabList.Length - 1]
             let mutable found = false
             for i in 0 .. tabList.Length - 1 do
                 if not found then
                     let t = tabList.[i]
-                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    let tLen = if this.isPinned(t) then pinned else unpinned
                     let boundary = offset + tLen - this.tabOverlap / 2.0
                     if relX < boundary || i = tabList.Length - 1 then
                         result <- t
@@ -675,34 +697,31 @@ type TabStripSprite<'id> when 'id : equality = {
                     offset <- offset + tLen - this.tabOverlap
             Some(result)
 
-    // Pinned tab width: fixed at pinnedTabMaxLen unless space is too tight
-    member private this.pinnedTabLength =
-        if this.pinnedCount = 0 then this.pinnedTabMaxLen
-        else
-            let totalOverlap = float(max 0 (this.count - 1)) * this.tabOverlap
-            let availableWidth = float(this.size.width) + totalOverlap
-            let pinnedMaxTotal = float(this.pinnedCount) * this.pinnedTabMaxLen
-            let unpinnedRemaining = availableWidth - pinnedMaxTotal
-            // If unpinned tabs still have at least 1px each, keep pinned at max
-            if this.unpinnedCount = 0 || unpinnedRemaining / float(this.unpinnedCount) >= 1.0 then
-                this.pinnedTabMaxLen
-            else
-                // Everything too tight, use uniform width
-                availableWidth / float(this.count)
+    // Compute both widths from one count of the strip, not once per tab.
+    member private this.tabLengths =
+        let count = this.count
+        let pinnedCount = this.pinnedCount
+        let unpinnedCount = count - pinnedCount
+        let availableWidth = float(this.size.width) + float(max 0 (count - 1)) * this.tabOverlap
+        let pinnedMax = this.pinnedTabMaxLen
+        let pinned =
+            if pinnedCount = 0 || unpinnedCount = 0 ||
+               (availableWidth - float(pinnedCount) * pinnedMax) / float(unpinnedCount) >= 1.0 then pinnedMax
+            else availableWidth / float(count)
+        let unpinned =
+            if unpinnedCount = 0 then this.unpinnedTabMaxLen
+            else min ((availableWidth - float(pinnedCount) * pinned) / float(unpinnedCount)) this.unpinnedTabMaxLen
+        pinned, unpinned
 
-    // Unpinned tab width: fills remaining space after pinned tabs
-    member private this.unpinnedTabLength =
-        if this.unpinnedCount = 0 then this.unpinnedTabMaxLen
-        else
-            let totalOverlap = float(max 0 (this.count - 1)) * this.tabOverlap
-            let availableWidth = float(this.size.width) + totalOverlap
-            let pinnedTotal = float(this.pinnedCount) * this.pinnedTabLength
-            let unpinnedAvailable = availableWidth - pinnedTotal
-            min (unpinnedAvailable / float(this.unpinnedCount)) this.unpinnedTabMaxLen
+    member private this.pinnedTabLength = fst this.tabLengths
+    member private this.unpinnedTabLength = snd this.tabLengths
 
     member private this.tabSpriteRec (tab:'id) : TabSprite<'id> =
+        this.tabSpriteWithLengths this.tabLengths tab
+
+    member private this.tabSpriteWithLengths (pinned, unpinned) (tab:'id) : TabSprite<'id> =
         let isPinned = this.isPinned(tab)
-        let tabLen = if isPinned then this.pinnedTabLength else this.unpinnedTabLength
+        let tabLen = if isPinned then pinned else unpinned
         {
             TabSprite.id = tab
             isTop =
@@ -713,7 +732,7 @@ type TabStripSprite<'id> when 'id : equality = {
             displayInfo = this.tabs.find(tab)
             appearance =
                 if isPinned then
-                    { this.appearance with tabMaxWidth = int(this.pinnedTabLength) }
+                    { this.appearance with tabMaxWidth = int(pinned) }
                 else
                     this.appearance
             // - 1: the one-device-pixel hairline that separates the tab from
@@ -743,10 +762,10 @@ type TabStripSprite<'id> when 'id : equality = {
         // Img rather than a bare Bitmap so this surface is pinned to 96 dpi
         // like every other one (see Drawing.fs).
         let img = Img(if this.size.isEmptyArea then Sz(1, 1) else this.size)
-        let gr = img.graphics
+        use gr = img.graphics
         do gr.SmoothingMode <- SmoothingMode.AntiAlias
         let bounds = Rect(Pt(), this.size)
-        do  gr.FillRectangle(new SolidBrush(bgColor), bounds.Rectangle)
+        gr.Clear(bgColor)
         img
 
     // Which end of the strip the one-pixel hairline sits at: below the tabs
@@ -758,31 +777,43 @@ type TabStripSprite<'id> when 'id : equality = {
         | TabDown -> 1
 
     member this.tabLocation tab =
+        let pinned, unpinned = this.tabLengths
+        let length tab = if this.isPinned tab then pinned else unpinned
         match this.slide with
         | Some(slideTab, x) when tab = slideTab ->
             // Pivot tab: render at drag x, clamped to its own single-tab
             // width. Group members may extend beyond the strip edge — that
             // is the natural consequence of dragging a group near an edge
             // and the user can drag back.
-            let tabLen = if this.isPinned(tab) then this.pinnedTabLength else this.unpinnedTabLength
+            let tabLen = length tab
             let bounds = (0, this.size.width - int(tabLen))
             Pt(between bounds x, this.tabYOffset)
         | Some(pivotTab, pivotX) when tab <> pivotTab && this.isDragGroupMember tab ->
             // Group member: pivot.x + signed offset (left = negative,
             // right = positive). Use the same single-tab clamp as the
             // pivot so the group members track the visible pivot.
-            let pivotLen = if this.isPinned(pivotTab) then this.pinnedTabLength else this.unpinnedTabLength
+            let pivotLen = length pivotTab
             let pivotBounds = (0, this.size.width - int(pivotLen))
             let clampedPivot = between pivotBounds pivotX
             let offset = this.dragGroupOffsetOf tab
             Pt(clampedPivot + int(offset), this.tabYOffset)
         | _ ->
-            let adjusted = this.adjustedVisualOrder
-            let tabAlignment = this.getAdjustedAlignment(tab)
-            let groupTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = tabAlignment)
+            let moved = this.movedTab
+            let adjusted = this.adjustOrder moved
+            let group = Set2(List2(this.dragGroup))
+            let align tab =
+                match moved with
+                | Some(pivot, _, alignment) when pivot = tab || group.contains(tab) -> alignment
+                | _ -> this.getTabAlign tab
+            let tabAlignment = align tab
+            let groupTabs = adjusted.where(fun t -> align t = tabAlignment)
             let groupStartX =
                 match tabAlignment with
                 | TopLeft -> 0.0
+                | TopCenter ->
+                    this.centerStart(this.calcGroupWidth(groupTabs),
+                        this.calcGroupWidth(adjusted.where(fun t -> align t = TopLeft)),
+                        this.calcGroupWidth(adjusted.where(fun t -> align t = TopRight)))
                 | TopRight ->
                     let groupWidth = this.calcGroupWidth(groupTabs)
                     max 0.0 (float(this.size.width) - groupWidth)
@@ -792,6 +823,7 @@ type TabStripSprite<'id> when 'id : equality = {
     member this.tabSize = Sz(int(this.unpinnedTabLength), (this.size.height) - 1)
 
     member this.movedTab : ('id * int * TabAlign) option =
+        let pinned, unpinned = this.tabLengths
         match this.slide with
         | Some(tab, x) ->
             if this.count = 0 then Some(tab, 0, TopLeft)
@@ -808,11 +840,12 @@ type TabStripSprite<'id> when 'id : equality = {
                 // the head's center.
                 let groupTabs =
                     if List.isEmpty this.dragGroup then [tab] else this.dragGroup
-                let inGroup t = List.contains t groupTabs
+                let groupSet = Set2(List2(groupTabs))
+                let inGroup t = groupSet.contains t
                 let groupHead =
                     if List.isEmpty this.dragGroup then tab else List.head this.dragGroup
                 let dragTabLen =
-                    if this.isPinned(groupHead) then this.pinnedTabLength else this.unpinnedTabLength
+                    if this.isPinned(groupHead) then pinned else unpinned
                 let groupHeadX = float(x) + this.dragGroupOffsetOf groupHead
                 let centerX = groupHeadX + dragTabLen / 2.0
 
@@ -820,11 +853,12 @@ type TabStripSprite<'id> when 'id : equality = {
                 // drag group, not just the pivot).
                 let leftWithout = this.visualOrder.where(fun t -> not (inGroup t) && this.getTabAlign(t) = TopLeft).list
                 let rightWithout = this.visualOrder.where(fun t -> not (inGroup t) && this.getTabAlign(t) = TopRight).list
+                let centerWithout = this.visualOrder.where(fun t -> not (inGroup t) && this.getTabAlign(t) = TopCenter).list
                 let calcWidth (tabs: 'id list) =
                     if tabs.IsEmpty then 0.0
                     else
                         let total = tabs |> List.sumBy (fun t ->
-                            if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+                            if this.isPinned(t) then pinned else unpinned)
                         total - float(tabs.Length - 1) * this.tabOverlap
                 let leftWidthWithout = calcWidth leftWithout
                 let rightWidthWithout = calcWidth rightWithout
@@ -834,7 +868,9 @@ type TabStripSprite<'id> when 'id : equality = {
                 let emptyCenterWithout = (leftWidthWithout + rightStartXWithout) / 2.0
 
                 // Determine target alignment
-                let targetAlignment = if centerX >= emptyCenterWithout then TopRight else TopLeft
+                let targetAlignment =
+                    if this.getTabAlign(tab) = TopCenter then TopCenter
+                    elif centerX >= emptyCenterWithout then TopRight else TopLeft
 
                 // For position calculation within the group, include the dragged blob's
                 // width in the target alignment group to match how tabLocation renders
@@ -853,6 +889,9 @@ type TabStripSprite<'id> when 'id : equality = {
                 let (groupList, groupStartX) =
                     match targetAlignment with
                     | TopLeft -> (leftWithout, 0.0)
+                    | TopCenter ->
+                        let fullWidth = calcWidth (centerWithout @ groupTabs)
+                        (centerWithout, this.centerStart(fullWidth, leftWidthWithout, rightWidthWithout))
                     | TopRight ->
                         let startX = float(this.size.width) - rightWidthFull
                         (rightWithout, startX)
@@ -872,11 +911,12 @@ type TabStripSprite<'id> when 'id : equality = {
                     let n = List.length groupTabs
                     let total =
                         groupTabs |> List.sumBy (fun t ->
-                            if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+                            if this.isPinned(t) then pinned else unpinned)
                     total - float(max 0 (n - 1)) * this.tabOverlap
                 let judgeX =
                     if isRightMulti then groupHeadX + groupTotalWidth / 2.0
                     else groupHeadX
+                let groupArray = List.toArray groupList
                 let groupIndex =
                     if groupList.IsEmpty then 0
                     else
@@ -885,8 +925,8 @@ type TabStripSprite<'id> when 'id : equality = {
                         let mutable found = false
                         for i in 0 .. groupList.Length - 1 do
                             if not found then
-                                let t = groupList.[i]
-                                let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                                let t = groupArray.[i]
+                                let tLen = if this.isPinned(t) then pinned else unpinned
                                 // Swap when judgeX crosses t's CENTER.
                                 // judgeX is the variant-specific basis
                                 // (group center for right-multi, group
@@ -901,12 +941,13 @@ type TabStripSprite<'id> when 'id : equality = {
                 // Convert group index to visual order index for splicing.
                 // visualWithout = visualOrder - the whole drag group.
                 let visualWithout = this.visualOrder.where(fun t -> not (inGroup t)).list
+                let visualArray = List.toArray visualWithout
                 let mutable groupCount = 0
                 let mutable visualIdx = visualWithout.Length
                 let mutable found2 = false
                 for i in 0 .. visualWithout.Length - 1 do
                     if not found2 then
-                        let t = visualWithout.[i]
+                        let t = visualArray.[i]
                         if this.getTabAlign(t) = targetAlignment then
                             if groupCount = groupIndex then
                                 visualIdx <- i
@@ -933,7 +974,10 @@ type TabStripSprite<'id> when 'id : equality = {
         | None -> None
 
     member this.adjustedVisualOrder : List2<'id> =
-        match this.movedTab with
+        this.adjustOrder this.movedTab
+
+    member private this.adjustOrder (moved: ('id * int * TabAlign) option) : List2<'id> =
+        match moved with
         | Some(tab, index, _) ->
             if List.isEmpty this.dragGroup then
                 this.visualOrder.move((=)tab, index)
@@ -952,10 +996,54 @@ type TabStripSprite<'id> when 'id : equality = {
 
 
     member this.sprite =
+        // The snapshot is immutable. Share its layout within this sprite tree.
+        let children = lazy (this.layoutChildren())
         {
             new ISprite with
             member x.image = this.bgImage
             member x.children =
+                children.Value
+        }
+
+    member private this.layoutChildren() =
+                let lengths = this.tabLengths
+                let pinned, unpinned = lengths
+                let length tab = if this.isPinned tab then pinned else unpinned
+                let moved = this.movedTab
+                let adjusted = this.adjustOrder moved
+                let group = Set2(List2(this.dragGroup))
+                let align tab =
+                    match moved with
+                    | Some(pivot, _, alignment) when pivot = tab || group.contains(tab) -> alignment
+                    | _ -> this.getTabAlign tab
+                let locations = System.Collections.Generic.Dictionary<'id, Pt>()
+                let lanes =
+                    [TopLeft;TopCenter;TopRight] |> List.map(fun alignment ->
+                        let tabs = adjusted.where(fun tab -> align tab = alignment)
+                        let width =
+                            if tabs.isEmpty then 0.0
+                            else (tabs.list |> List.sumBy length) - float(tabs.length - 1) * this.tabOverlap
+                        alignment, tabs, width)
+                let (_, _, leftWidth) = lanes.[0]
+                let (_, _, rightWidth) = lanes.[2]
+                for alignment, tabs, width in lanes do
+                    let start =
+                        match alignment with
+                        | TopLeft -> 0.0
+                        | TopCenter -> this.centerStart(width, leftWidth, rightWidth)
+                        | TopRight -> max 0.0 (float(this.size.width) - width)
+                    let mutable offset = 0.0
+                    for tab in tabs.list do
+                        locations.[tab] <- Pt(int(start + offset), this.tabYOffset)
+                        offset <- offset + length tab - this.tabOverlap
+                match this.slide with
+                | Some(pivot, x) ->
+                    let pivotX = between (0, this.size.width - int(length pivot)) x
+                    locations.[pivot] <- Pt(pivotX, this.tabYOffset)
+                    for tab in this.dragGroup do
+                        if tab <> pivot then
+                            locations.[tab] <- Pt(pivotX + int(this.dragGroupOffsetWithLengths lengths tab), this.tabYOffset)
+                | None -> ()
                 // Z-order: when a multi-tab drag group is active, bring its
                 // members to the front (end of children = topmost),
                 // ordered by visualOrder so left→right Chrome-style overlap
@@ -967,17 +1055,45 @@ type TabStripSprite<'id> when 'id : equality = {
                     if List.isEmpty this.dragGroup then
                         this.zorder
                     else
-                        let grp = this.dragGroup
-                        let nonGroup = this.zorder.where(fun t -> not (List.contains t grp))
-                        let groupOrdered = this.visualOrder.where(fun t -> List.contains t grp)
+                        let nonGroup = this.zorder.where(fun t -> not (group.contains t))
+                        let groupOrdered = this.visualOrder.where(fun t -> group.contains t)
                         nonGroup.appendList(groupOrdered)
                 order.map <| fun (tab:'id) ->
-                    (this.tabLocation tab, this.tabSprite(tab))
-        }
+                    (locations.[tab], this.tabSpriteWithLengths lengths tab :> ISprite)
 
     member this.renderTab tab = this.tabSprite(tab).render
 
     member this.render = this.sprite.render
+
+    // Cache only tab pixels, never positions. Dragging reuses unchanged tabs;
+    // title/icon/theme/size/hover changes replace the affected owned surface.
+    member this.renderCached (cache: System.Collections.Generic.Dictionary<'id, TabSprite<'id> * Img>) =
+        this.renderCachedWithExtent(cache, this.size) |> fst
+
+    member this.renderCachedWithExtent (cache: System.Collections.Generic.Dictionary<'id, TabSprite<'id> * Img>, surfaceSize: Sz) =
+        let sprite = this.sprite
+        let image = { this with size = surfaceSize }.bgImage
+        let mutable rightEdge = 0
+        try
+            use graphics = image.graphics
+            for location, child in sprite.children.reverse.list do
+                let tab = child :?> TabSprite<'id>
+                rightEdge <- max rightEdge (location.x + tab.size.width)
+                let pixels =
+                    match cache.TryGetValue(tab.id) with
+                    | true, (previous, pixels) when previous = tab -> pixels
+                    | entry ->
+                        let pixels = child.render
+                        match entry with
+                        | true, (_, previous) -> previous.bitmap.Dispose()
+                        | _ -> ()
+                        cache.[tab.id] <- (tab, pixels)
+                        pixels
+                graphics.DrawImageUnscaled(pixels.bitmap, location.Point)
+            image, rightEdge
+        with _ ->
+            image.bitmap.Dispose()
+            reraise()
 
     member this.tryHit pt =
         // Determine the owning tab purely geometrically (boundary at the
@@ -1010,17 +1126,28 @@ type TabStripSprite<'id> when 'id : equality = {
             let tabH = (this.size.height) - 1
             if pt.y >= yOff && pt.y < yOff + tabH then
                 let x = float(pt.x)
-                let adjusted = this.adjustedVisualOrder
-                let leftTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = TopLeft)
-                let rightTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = TopRight)
+                let moved = this.movedTab
+                let adjusted = this.adjustOrder moved
+                let group = Set2(List2(this.dragGroup))
+                let alignment tab =
+                    match moved with
+                    | Some(pivot, _, align) when tab = pivot || group.contains(tab) -> align
+                    | _ -> this.getTabAlign tab
+                let leftTabs = adjusted.where(fun t -> alignment t = TopLeft)
+                let rightTabs = adjusted.where(fun t -> alignment t = TopRight)
+                let centerTabs = adjusted.where(fun t -> alignment t = TopCenter)
                 let leftWidth = this.calcGroupWidth(leftTabs)
                 let rightWidth = this.calcGroupWidth(rightTabs)
                 let rightStartX = float(this.size.width) - rightWidth
                 let trim = max 0.0 (this.tabOverlap / 2.0)
+                let centerWidth = this.calcGroupWidth(centerTabs)
+                let centerStart = this.centerStart(centerWidth, leftWidth, rightWidth)
                 if x < leftWidth - trim && not leftTabs.isEmpty then
                     this.hitInGroup leftTabs 0.0 x
                 elif x >= rightStartX && x < float(this.size.width) - trim && not rightTabs.isEmpty then
                     this.hitInGroup rightTabs rightStartX x
+                elif not centerTabs.isEmpty && x >= centerStart && x < centerStart + centerWidth - trim then
+                    this.hitInGroup centerTabs centerStart x
                 else
                     None
             else

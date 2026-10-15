@@ -226,6 +226,8 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
     member private this.init() =
         Services.registerLocal(_ts)
         group.init(this.ts)
+        this.ts.newTabRequested.Add(fun() ->
+            if not group.windows.isEmpty then this.launchTab(group.topWindow))
         // Register this decorator in the global registry
         lock decorators (fun () -> decorators.[group.hwnd] <- this)
 
@@ -1657,6 +1659,57 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
     // the per-group application icons and the hand-painted colour swatches.
     // Win32Menu.show is given the same number for the bitmap size it resizes
     // to, so nothing in the menu is drawn at one scale and shown at another.
+    member private this.withLaunchPath(hwnd: IntPtr, launchCall: string -> unit) =
+        let processPath = os.windowFromHwnd(hwnd).pid.processPath
+        // Helper function to get alternative launch command for UWP apps
+        let getAlternativeLaunchCommand(path: string) =
+            let fileName = System.IO.Path.GetFileName(path).ToLowerInvariant()
+            if fileName.Contains("windowsterminal") then
+                Some("wt.exe")
+            else
+                None
+
+        // Resolve the actual path to hand to Process.Start.
+        // For known UWP apps we use an alternative launch command (e.g. wt.exe).
+        // Returns None only for UWP apps with no alternative - the caller then surfaces an error.
+        let resolveLaunchPath () =
+            if processPath.Contains("WindowsApps") then
+                getAlternativeLaunchCommand(processPath)
+            else
+                Some(processPath)
+
+        // Shared error reporting wrapper used by all three new-launch menu items
+        let showUwpError () =
+            let appName = System.IO.Path.GetFileNameWithoutExtension(processPath)
+            let message = String.Format(Localization.getString("NewLaunchErrorUWP"), appName)
+            MessageBox.Show(message, "WindowTabs", MessageBoxButtons.OK, MessageBoxIcon.Information) |> ignore
+        try
+            match resolveLaunchPath() with
+            | Some(path) -> launchCall path
+            | None -> showUwpError ()
+        with
+        | :? System.ComponentModel.Win32Exception as ex when processPath.Contains("WindowsApps") ->
+            showUwpError ()
+            System.Diagnostics.Debug.WriteLine(sprintf "UWP app cannot be launched: %s - %s" processPath ex.Message)
+        | :? System.ComponentModel.Win32Exception as ex ->
+            let message = String.Format(Localization.getString("NewLaunchErrorProcess"), processPath, ex.Message)
+            MessageBox.Show(message, "WindowTabs Error", MessageBoxButtons.OK, MessageBoxIcon.Error) |> ignore
+            System.Diagnostics.Debug.WriteLine(sprintf "Error starting process: %s - %s" processPath ex.Message)
+        | ex ->
+            let message = String.Format(Localization.getString("NewLaunchErrorUnexpected"), ex.Message)
+            MessageBox.Show(message, "WindowTabs Error", MessageBoxButtons.OK, MessageBoxIcon.Error) |> ignore
+            System.Diagnostics.Debug.WriteLine(sprintf "Unexpected error starting process: %s - %s" processPath ex.Message)
+
+
+    member private this.newTabArguments(path: string) =
+        if String.Equals(System.IO.Path.GetFileName(path), "explorer.exe", StringComparison.OrdinalIgnoreCase) then
+            Shell.explorerLaunchArguments(group.topWindow)
+        else ""
+
+    member private this.launchTab(hwnd) =
+        this.withLaunchPath(hwnd, fun path ->
+            Services.program.launchNewWindow group.hwnd hwnd path (this.newTabArguments(path)))
+
     member private  this.contextMenu(hwnd, menuScale: float) =
         let checked(isChecked) = if isChecked then List2([MenuFlags.MF_CHECKED]) else List2()
         let grayed(isGrayed) = if isGrayed then List2([MenuFlags.MF_GRAYED]) else List2()
@@ -1797,45 +1850,7 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
         let exeName = pid.exeName
         let processPath = pid.processPath
 
-        // Helper function to get alternative launch command for UWP apps
-        let getAlternativeLaunchCommand(path: string) =
-            let fileName = System.IO.Path.GetFileName(path).ToLowerInvariant()
-            if fileName.Contains("windowsterminal") then
-                Some("wt.exe")
-            else
-                None
-
-        // Resolve the actual path to hand to Process.Start.
-        // For known UWP apps we use an alternative launch command (e.g. wt.exe).
-        // Returns None only for UWP apps with no alternative - the caller then surfaces an error.
-        let resolveLaunchPath () =
-            if processPath.Contains("WindowsApps") then
-                getAlternativeLaunchCommand(processPath)
-            else
-                Some(processPath)
-
-        // Shared error reporting wrapper used by all three new-launch menu items
-        let showUwpError () =
-            let appName = System.IO.Path.GetFileNameWithoutExtension(processPath)
-            let message = String.Format(Localization.getString("NewLaunchErrorUWP"), appName)
-            MessageBox.Show(message, "WindowTabs", MessageBoxButtons.OK, MessageBoxIcon.Information) |> ignore
-        let handleLaunchError (launchCall: string -> unit) =
-            try
-                match resolveLaunchPath() with
-                | Some(path) -> launchCall path
-                | None -> showUwpError ()
-            with
-            | :? System.ComponentModel.Win32Exception as ex when processPath.Contains("WindowsApps") ->
-                showUwpError ()
-                System.Diagnostics.Debug.WriteLine(sprintf "UWP app cannot be launched: %s - %s" processPath ex.Message)
-            | :? System.ComponentModel.Win32Exception as ex ->
-                let message = String.Format(Localization.getString("NewLaunchErrorProcess"), processPath, ex.Message)
-                MessageBox.Show(message, "WindowTabs Error", MessageBoxButtons.OK, MessageBoxIcon.Error) |> ignore
-                System.Diagnostics.Debug.WriteLine(sprintf "Error starting process: %s - %s" processPath ex.Message)
-            | ex ->
-                let message = String.Format(Localization.getString("NewLaunchErrorUnexpected"), ex.Message)
-                MessageBox.Show(message, "WindowTabs Error", MessageBoxButtons.OK, MessageBoxIcon.Error) |> ignore
-                System.Diagnostics.Debug.WriteLine(sprintf "Unexpected error starting process: %s - %s" processPath ex.Message)
+        let handleLaunchError launchCall = this.withLaunchPath(hwnd, launchCall)
 
         // Find the decorator whose group contains the given window hwnd.
         // Used by the "new window + position" callback to reach the newly created group.
@@ -1865,7 +1880,7 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
                 flags = List2()
                 image = None
                 click = fun() ->
-                    handleLaunchError (fun path -> Services.program.launchNewWindow group.hwnd hwnd path)
+                    this.launchTab(hwnd)
             })
 
         // Item 2: "New window (position)" — launch as standalone then apply a position to the new group.
@@ -1990,7 +2005,7 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
                                     image = groupMenuIcon info
                                     click = fun() ->
                                         handleLaunchError (fun path ->
-                                            Services.program.launchNewWindow decorator.group.hwnd hwnd path)
+                                            Services.program.launchNewWindow decorator.group.hwnd hwnd path (this.newTabArguments(path)))
                                     flags = List2()
                                 }))
                             | None -> None
@@ -2068,6 +2083,7 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
                         flags = if allTopLeft then List2([MenuFlags.MF_GRAYED]) else List2()
                         click = fun() ->
                             group.setTabsAlign(group.visualOrder.list, TopLeft)
+                            group.rememberGroupPreference("Alignment", "TopLeft")
                     })
                     CmiRegular({
                         text = Localization.getString("AlignAllTopRight")
@@ -2075,6 +2091,15 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
                         flags = if allTopRight then List2([MenuFlags.MF_GRAYED]) else List2()
                         click = fun() ->
                             group.setTabsAlign(group.visualOrder.list, TopRight)
+                            group.rememberGroupPreference("Alignment", "TopRight")
+                    })
+                    CmiRegular({
+                        text = Localization.getString("AlignAllTopCenter")
+                        image = None
+                        flags = if group.visualOrder.list |> List.forall (fun h -> group.getTabAlign(h) = TopCenter) then List2([MenuFlags.MF_GRAYED]) else List2()
+                        click = fun() ->
+                            group.setTabsAlign(group.visualOrder.list, TopCenter)
+                            group.rememberGroupPreference("Alignment", "TopCenter")
                     })
                     CmiSeparator
                     leftItem
@@ -2823,6 +2848,20 @@ type TabStripDecorator(group:WindowGroup, notifyDetached: IntPtr -> unit) as thi
             @ (positionMoveMenuItems |> List.map Some)
             @ [
             Some(moveTabGroupToGroupMenu)
+            Some(CmiRegular({
+                text = Localization.getString("CombineGroupTaskbarIcons")
+                image = None
+                flags = checked(group.isSuperBarEnabled)
+                click = fun() ->
+                    group.isSuperBarEnabled <- not group.isSuperBarEnabled
+                    group.rememberGroupPreference("MergeTaskbar", string group.isSuperBarEnabled)
+            }))
+            Some(CmiRegular({
+                text = Localization.getString("MinimizeBackgroundTabs")
+                image = None
+                flags = checked(group.minimizeBackgroundTabs)
+                click = fun() -> Services.settings.setValue("minimizeBackgroundTabs", box(not group.minimizeBackgroundTabs))
+            }))
             Some(CmiSeparator)
             // Tab Detach and Split submenu containing both detach and link menus
             (

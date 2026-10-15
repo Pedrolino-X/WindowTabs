@@ -94,34 +94,36 @@ namespace Bemo
         {
             RECT windowRect;
             WinUserApi.GetWindowRect(hwnd, out windowRect);
-            IntPtr hdc = WinUserApi.GetWindowDC(hwnd);
             Bitmap bmp = new Bitmap(windowRect.Width, windowRect.Height, PixelFormat.Format32bppArgb);
-            Graphics gfxBmp = Graphics.FromImage(bmp);
-            gfxBmp.FillRectangle(new SolidBrush(Color.FromArgb(0,0,0,0)), new Rectangle(Point.Empty, bmp.Size));
-            IntPtr hdcBitmap = gfxBmp.GetHdc();
-            bool succeeded = WinUserApi.PrintWindow(hwnd, hdcBitmap, PW_RENDERFULLCONTENT);
-            if (!succeeded)
+            try
             {
-                // Fall back to the legacy rendering path
-                succeeded = WinUserApi.PrintWindow(hwnd, hdcBitmap, 0);
-            }
-            gfxBmp.ReleaseHdc(hdcBitmap);
-            if (!succeeded)
-            {
-                gfxBmp.FillRectangle(new SolidBrush(Color.Gray), new Rectangle(Point.Empty, bmp.Size));
-            }
-            IntPtr hRgn = WinGdiApi.CreateRectRgn(0, 0, 0, 0);
-            WinUserApi.GetWindowRgn(hwnd, hRgn);
-            Region region = Region.FromHrgn(hRgn);
-            if (!region.IsEmpty(gfxBmp))
-            {
-                gfxBmp.ExcludeClip(region);
-                gfxBmp.Clear(Color.FromArgb(0, 0, 0, 0));
-            }
-            region.Dispose();
-            WinGdiApi.DeleteObject(hRgn);
-            gfxBmp.Dispose();
-            WinUserApi.ReleaseDC(hwnd, hdc);
+                using (Graphics gfxBmp = Graphics.FromImage(bmp))
+                {
+                    gfxBmp.Clear(Color.Transparent);
+                    IntPtr hdcBitmap = gfxBmp.GetHdc();
+                    bool succeeded;
+                    try
+                    {
+                        succeeded = WinUserApi.PrintWindow(hwnd, hdcBitmap, PW_RENDERFULLCONTENT);
+                        if (!succeeded) succeeded = WinUserApi.PrintWindow(hwnd, hdcBitmap, 0);
+                    }
+                    finally { gfxBmp.ReleaseHdc(hdcBitmap); }
+                    if (!succeeded) gfxBmp.Clear(Color.Gray);
+                    IntPtr hRgn = WinGdiApi.CreateRectRgn(0, 0, 0, 0);
+                    try
+                    {
+                        WinUserApi.GetWindowRgn(hwnd, hRgn);
+                        using (Region region = Region.FromHrgn(hRgn))
+                        {
+                            if (!region.IsEmpty(gfxBmp))
+                            {
+                                gfxBmp.ExcludeClip(region);
+                                gfxBmp.Clear(Color.Transparent);
+                            }
+                        }
+                    }
+                    finally { if (hRgn != IntPtr.Zero) WinGdiApi.DeleteObject(hRgn); }
+                }
 
             // The window rect of a DWM window includes the invisible resize
             // borders; the visible window is the extended frame bounds. Crop
@@ -143,10 +145,13 @@ namespace Bemo
                 }
             }
             return bmp;
+            }
+            catch { bmp.Dispose(); throw; }
         }
  
         public static void UpdateLayeredWindow(IntPtr hwnd, Point location, Bitmap bitmap, byte alpha)
         {
+            IntPtr hdc = IntPtr.Zero, bmpDc = IntPtr.Zero, hBitmap = IntPtr.Zero, originalBitmap = IntPtr.Zero;
             try
             {
                 BLENDFUNCTION blend = new BLENDFUNCTION();
@@ -157,18 +162,21 @@ namespace Bemo
                 POINT srcLocation = new POINT();
                 POINT dstLocation = POINT.FromPoint(location);
                 SIZE dstSize = SIZE.FromSize(bitmap.Size);
-                IntPtr hdc = WinUserApi.GetWindowDC(hwnd);
-                IntPtr bmpDc = WinGdiApi.CreateCompatibleDC(hdc);
-                IntPtr hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
-                IntPtr originalBitmap = WinGdiApi.SelectObject(bmpDc, hBitmap);
+                hdc = WinUserApi.GetWindowDC(hwnd);
+                bmpDc = WinGdiApi.CreateCompatibleDC(hdc);
+                hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
+                originalBitmap = WinGdiApi.SelectObject(bmpDc, hBitmap);
                 WinUserApi.UpdateLayeredWindow(hwnd, IntPtr.Zero, ref dstLocation, ref dstSize, bmpDc, ref srcLocation, 0, ref blend, UpdateLayeredWindowFlags.ULW_ALPHA);
-                WinGdiApi.SelectObject(bmpDc, originalBitmap);
-                WinGdiApi.DeleteObject(hBitmap);
-                WinGdiApi.DeleteDC(bmpDc);
-                WinUserApi.ReleaseDC(hwnd, hdc);
             }
             catch
             {
+            }
+            finally
+            {
+                if (originalBitmap != IntPtr.Zero && originalBitmap != new IntPtr(-1)) WinGdiApi.SelectObject(bmpDc, originalBitmap);
+                if (hBitmap != IntPtr.Zero) WinGdiApi.DeleteObject(hBitmap);
+                if (bmpDc != IntPtr.Zero) WinGdiApi.DeleteDC(bmpDc);
+                if (hdc != IntPtr.Zero) WinUserApi.ReleaseDC(hwnd, hdc);
             }
         }
         public static void UpdateLayeredWindow(IntPtr hwnd, Point location)
@@ -380,14 +388,20 @@ namespace Bemo
         public static Bitmap ScaleImage(Bitmap bmp, double xScale, double yScale)
         {
             Bitmap bmpScaled = new Bitmap((int)((double)bmp.Width / xScale), (int)((double)bmp.Height / yScale), PixelFormat.Format32bppArgb);
-            Graphics graphics = Graphics.FromImage(bmpScaled);
-            graphics.SmoothingMode = SmoothingMode.HighQuality;
-            graphics.CompositingQuality = CompositingQuality.HighQuality;
-            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            graphics.DrawImage(bmp, new Rectangle(Point.Empty, bmpScaled.Size));
-            graphics.Dispose();
-            return bmpScaled;
+            try
+            {
+                using (Graphics graphics = Graphics.FromImage(bmpScaled))
+                {
+                    graphics.SmoothingMode = SmoothingMode.HighQuality;
+                    graphics.CompositingQuality = CompositingQuality.HighQuality;
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.DrawImage(bmp, new Rectangle(Point.Empty, bmpScaled.Size));
+                }
+                return bmpScaled;
+            }
+            catch { bmpScaled.Dispose(); throw; }
         }
+
         public static POINT GetCursorLocation()
         {
             POINT pt;

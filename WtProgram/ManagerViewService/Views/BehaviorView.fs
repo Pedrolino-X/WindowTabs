@@ -222,6 +222,7 @@ type HotKeyView() =
             // hideTabsDelayMilliseconds is now integrated into hideTabsRadio panel
             ("HideTabsOnFullscreen", settingsCheckbox "hideTabsOnFullscreen")
             ("SnapTabHeightMargin", settingsCheckbox "snapTabHeightMargin")
+            ("CombineTaskbarIconsByDefault", settingsCheckbox "combineTaskbarIconsByDefault")
         ]))
 
         let formPanel = UIHelper.form fields

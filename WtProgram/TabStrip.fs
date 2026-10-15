@@ -1,4 +1,4 @@
-namespace Bemo
+﻿namespace Bemo
 open System
 open System.Collections
 open System.Drawing
@@ -22,25 +22,29 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let _os = OS()
     let taskbar = _os.getTaskbar()
     let tabMovedEvent = Event<_>()
+    let newTabRequestedEvent = Event<unit>()
+    let newTabHover = new Bemo.Cell<_>(Cell, false, checkEq=(=))
+    let newTabPressed = new Bemo.Cell<_>(Cell, false, checkEq=(=))
+    let mutable newTabBounds = Rectangle.Empty
     let contentBoundsCell = Cell.create(Rect())
     let appearanceCell = Cell.create(None)
     let foregroundCell = Cell.create(None:Tab option)
     let prevForegroundCell = Cell.create(None)
-    let sizeCell = Cell.create(Sz.empty)
-    let alphaCell = Cell.create(byte(0xFF))
-    let locationCell = Cell.create(Pt.empty)
+    let sizeCell = new Bemo.Cell<_>(Cell, Sz.empty, checkEq=(=))
+    let alphaCell = new Bemo.Cell<_>(Cell, byte(0xFF), checkEq=(=))
+    let locationCell = new Bemo.Cell<_>(Cell, Pt.empty, checkEq=(=))
     // DPI scale of the monitor the strip is currently placed on (1.0 = 100%),
     // refreshed from every setPlacement. The process is Per-Monitor-V2 aware,
     // so the strip's bitmap is presented 1:1 on that monitor and every
     // self-drawn size has to be multiplied by this factor to keep its former
     // apparent size. It replaces the old non-integer-DPI draw correction: with
     // no OS bitmap stretch left there is no drift to compensate for.
-    let scaleCell = Cell.create(1.0)
+    let scaleCell = new Bemo.Cell<_>(Cell, 1.0, checkEq=(=))
     let visualOrderCell = Cell.create(List2())
     let zorderCell = Cell.create(List2())
-    let visibleCell = Cell.create(false)
-    let transparentCell = Cell.create(true)
-    let showInsideCell = Cell.create(false)
+    let visibleCell = new Bemo.Cell<_>(Cell, false, checkEq=(=))
+    let transparentCell = new Bemo.Cell<_>(Cell, true, checkEq=(=))
+    let showInsideCell = new Bemo.Cell<_>(Cell, false, checkEq=(=))
     let isInAltTabCell = Cell.create(false)
     let pinnedTabsCell = Cell.create(Set2<Tab>())
     // Thread-safe snapshot of pinned tabs for cross-thread reads (e.g., save from main thread)
@@ -60,8 +64,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let mutable tabAlignmentSnapshot = Map2<Tab, TabAlign>()
     let defaultAlignmentCell = Cell.create(TopRight)
     let alignment = Cell.create(TopRight)
-    let capturedCell = Cell.create(None : Option<Tab*TabPart>)
-    let hoverCell = Cell.create(None : Option<Tab*TabPart>)
+    let capturedCell = new Bemo.Cell<_>(Cell, (None : Option<Tab*TabPart>), checkEq=(=))
+    let hoverCell = new Bemo.Cell<_>(Cell, (None : Option<Tab*TabPart>), checkEq=(=))
     let slideCell = Cell.create(None)
     // Multi-tab drag group: set by the decorator on drag begin to the
     // contiguous selected range (in visualOrder). The first element is the
@@ -84,9 +88,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let mutable tabBorderColorSnapshot = Map2<Tab, Color>()
     let hwndRef = ref IntPtr.Zero
     let isShrunkCell = Cell.create(false)
+    // Position has its own listener; Windows retains the last layered surface.
+    let mutable renderLocation = Pt.empty
+    let mutable hasPresentedImage = false
+    let tabImages = Collections.Generic.Dictionary<Tab, TabSprite<Tab> * Img>()
     // Tooltip implementation
     let tooltipForm = new Form()
     let tooltipLabel = new Label()
+    let menuFont = SystemFonts.MenuFont
     let tooltipTimer = new Timer(Interval = 500)
     // Polling fallback for stuck tooltips: WM_MOUSELEAVE does not always fire
     // (e.g. when the cursor glides off the leftmost tab along a screen edge
@@ -104,7 +113,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let tooltipBaseMaxWidth = 500
 
     let isMouseOverExport = Cell.export <| fun() ->
-        hoverCell.value.IsSome
+        hoverCell.value.IsSome || newTabHover.value || newTabPressed.value
 
     let addEvent(evt,handler) =
         eventHandlersCell.map(fun s -> s.add(_os.setSingleWinEvent evt handler))
@@ -128,7 +137,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         
         tooltipLabel.ForeColor <- Color.White
         tooltipLabel.BackColor <- Color.FromArgb(40, 40, 40)
-        tooltipLabel.Font <- SystemFonts.MenuFont // replaced with the DPI-scaled font on show
+        tooltipLabel.Font <- menuFont // replaced with the DPI-scaled font on show
         tooltipLabel.TextAlign <- ContentAlignment.TopLeft  // Top-left aligned for proper wrapping
         tooltipLabel.AutoSize <- false  // Keep false for proper width control
         tooltipLabel.MaximumSize <- new Size(tooltipBaseMaxWidth, 0)
@@ -191,6 +200,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             tabBorderColorSnapshot <- tabBorderColor.value
 
         Cell.listen <| fun() ->
+            renderLocation <- locationCell.value
+            if hasPresentedImage then this.window.updateLocation(renderLocation)
+        Cell.listen <| fun() ->
             this.update()
        
     member private this.inAltSwitch = isInAltTabCell.value
@@ -220,26 +232,33 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     // SystemIcons.Application instance from Window.icon - detected by
     // reference, so such windows keep their real small icon instead of being
     // silently replaced by the generic one.
-    member private this.tabIcon (ti: TabInfo) =
+    member private this.tabIcon scale (ti: TabInfo) =
         let isGeneric (icon: Icon) = Object.ReferenceEquals(icon, SystemIcons.Application)
         if isGeneric ti.iconBig then ti.iconSmall
         elif isGeneric ti.iconSmall then ti.iconBig
-        elif this.scale > 1.0 then ti.iconBig
+        elif scale > 1.0 then ti.iconBig
         else ti.iconSmall
 
     member private this.tsBase direction =
         // One font instance for the whole sprite tree (pixel-sized, see Dpi).
-        let textFont = Dpi.scaledFont SystemFonts.MenuFont this.scale
+        let scale = this.scale
+        let textFont = Dpi.scaledFont menuFont scale
+        let infos = tabInfoCell.value
+        let background = tabBgColor.value
+        let fills = tabFillColor.value
+        let underlines = tabUnderlineColor.value
+        let borders = tabBorderColor.value
+        let defaultInfo = {text="";isRenamed=false;iconSmall=SystemIcons.Application;iconBig=SystemIcons.Application;preview=(fun()->Img(Sz(1,1)))}
         {
-            tabs = Map2(this.tabs.items.map <| fun tab ->
-                let ti = this.tabInfo(tab)
+            tabs = Map2(visualOrderCell.value.map <| fun tab ->
+                let ti = infos.tryFind(tab).def(defaultInfo)
                 let tabInfo = {
-                    bgColor = tabBgColor.value.tryFind(tab)
-                    fillColor = tabFillColor.value.tryFind(tab)
-                    underlineColor = tabUnderlineColor.value.tryFind(tab)
-                    borderColor = tabBorderColor.value.tryFind(tab)
+                    bgColor = background.tryFind(tab)
+                    fillColor = fills.tryFind(tab)
+                    underlineColor = underlines.tryFind(tab)
+                    borderColor = borders.tryFind(tab)
                     TabDisplayInfo.text = ti.text
-                    icon = this.tabIcon ti
+                    icon = this.tabIcon scale ti
                     textFont = textFont
                     textBrush = SystemBrushes.MenuText
                 }
@@ -249,7 +268,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             captured = capturedCell.value
             visualOrder = visualOrderCell.value
             zorder = zorderCell.value
-            size = this.size
+            size = Sz(max 1 (this.size.width - Dpi.px this.scale 32), this.size.height)
             slide = this.slide
             direction = direction
             tabAlignments = tabAlignmentCell.value
@@ -267,7 +286,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         
     member private this.hit : Option<Tab*TabPart> = maybe {
         let! pt = ptCell.value
-        let! hit = this.ts.tryHit(pt)
+        let! hit = if newTabBounds.Contains(pt.Point) then None else this.ts.tryHit(pt)
         return hit
         }
 
@@ -321,7 +340,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     // Tooltip hit test: boundary at midpoint of tab overlap area, ignoring z-order
     member private this.hitForTooltipTab : Option<Tab> = maybe {
         let! pt = ptCell.value
-        let! tab = this.ts.tryHitForTooltip(pt)
+        let! tab = if newTabBounds.Contains(pt.Point) then None else this.ts.tryHitForTooltip(pt)
         return tab
         }
 
@@ -336,7 +355,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             let tooltipMaxWidth = scaled tooltipBaseMaxWidth
             let padding = scaled 8
             tooltipForm.Padding <- new Padding(padding, padding, padding, padding)
-            tooltipLabel.Font <- Dpi.scaledFont SystemFonts.MenuFont scale
+            tooltipLabel.Font <- Dpi.scaledFont menuFont scale
             tooltipLabel.MaximumSize <- new Size(tooltipMaxWidth, 0)
             // Move off-screen and ensure visible so rendering can occur
             tooltipForm.Location <- new Point(-10000, -10000)
@@ -381,8 +400,24 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             tooltipForm.BringToFront()
 
     member private this.processMouse(mouse) =
+        this.withUpdate(fun() -> this.processMouseCore(mouse))
+
+    member private this.processMouseCore(mouse) =
+        match mouse with
+        | MouseClick(pt, MouseLeft, action) when newTabBounds.Contains(pt.Point) || newTabPressed.value ->
+            match action with
+            | MouseDown -> newTabPressed.set(true)
+            | MouseUp ->
+                let launch = newTabPressed.value && newTabBounds.Contains(pt.Point)
+                newTabPressed.set(false)
+                if launch then newTabRequestedEvent.Trigger()
+            | _ -> ()
+        | _ -> this.processTabMouse(mouse)
+
+    member private this.processTabMouse(mouse) =
         match mouse with
         | MouseMove(pt) ->
+            newTabHover.set(newTabBounds.Contains(pt.Point))
             this.setPt(Some(pt))
             if this.window.hasCapture.not then 
                 this.window.trackMouseLeave()
@@ -443,6 +478,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 this.onMouse(action, pt, btn, (hitTab, hitPart))
             hoverCell.set(this.hit)
         | MouseLeave ->
+            newTabHover.set(false)
+            newTabPressed.set(false)
             // WM_MOUSELEAVE can fire while the cursor is still on a tab: a
             // tooltip/overlay pops up over a stationary cursor, or the layered
             // window repaints at a sub-pixel edge. Clearing the hover then makes
@@ -465,7 +502,6 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 pendingTooltipTab := None
                 tooltipTimer.Stop()
                 tooltipForm.Visible <- false
-        this.update()
 
     member private this.wndProc(msg:Win32Message) =
         // The mouse point is used as-is. The strip window is per-monitor DPI
@@ -514,7 +550,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     
     member private this.update() =
         if this.visible then
-            this.window.update(this.render, this.location, this.alpha)
+            let image = this.render
+            use bitmap = image.bitmap
+            this.window.update(image, renderLocation, this.alpha)
+            hasPresentedImage <- true
         else this.window.hide()
     
     // No draw correction any more. The former applyDrawCorrection pre-compressed
@@ -528,10 +567,29 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     // process gets the same physical value from both, so the rate is always 0.)
     member private this.render : Img =
         try
-            let img = this.ts.render
+            let img, rightEdge = this.ts.renderCachedWithExtent(tabImages, this.size)
+            newTabBounds <- Rectangle.Empty
+            if not this.isEmpty && this.size.width >= Dpi.px this.scale 48 then
+                let width = Dpi.px this.scale 28
+                let height = max 1 (this.size.height - Dpi.px this.scale 4)
+                let x = min (rightEdge + Dpi.px this.scale 2) (this.size.width - width)
+                let rect = Rectangle(x, Dpi.px this.scale 2, width - 1, height - 1)
+                newTabBounds <- rect
+                use g = img.graphics
+                let color = if newTabPressed.value then this.appearance.tabActiveTabColor elif newTabHover.value then this.appearance.tabMouseOverTabColor else this.appearance.tabInactiveTabColor
+                use fill = new SolidBrush(color)
+                use border = new Pen(this.appearance.tabInactiveBorderColor, 1.0f)
+                use pen = new Pen(this.appearance.tabInactiveTextColor, Dpi.pxf this.scale 1.3f)
+                g.FillRectangle(fill, rect)
+                g.DrawRectangle(border, rect)
+                let cx, cy = float32(rect.Left + rect.Width / 2), float32(rect.Top + rect.Height / 2)
+                let arm = Dpi.pxf this.scale 4.0f
+                g.DrawLine(pen, cx-arm, cy, cx+arm, cy)
+                g.DrawLine(pen, cx, cy-arm, cx, cy+arm)
             if this.isShrunk && this.direction = TabDirection.TabDown then
                 // Sliver of strip left visible when auto-hidden.
                 let sliver = Dpi.px this.scale 7
+                use bitmap = img.bitmap
                 img.clip(Rect(Pt(0, img.height - sliver), Sz(img.width, sliver)))
             else
                 img
@@ -540,10 +598,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
     member private this.withUpdate f =
         Cell.beginUpdate()
-        let result = f()
-        Cell.endUpdate()
-        result
+        try f()
+        finally Cell.endUpdate()
 
+    member this.newTabRequested = newTabRequestedEvent.Publish
     member this.hwnd = hwndRef.Value
     
     member this.addTabSlide tab (slide:Option<_>) =
@@ -565,6 +623,11 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.addTab tab = this.addTabSlide tab None
 
     member this.removeTab tab =
+        match tabImages.TryGetValue(tab) with
+        | true, (_, image) ->
+            image.bitmap.Dispose()
+            tabImages.Remove(tab) |> ignore
+        | _ -> ()
         // The scaled-icon cache is keyed by source HICON, and Windows recycles
         // icon handles once the window that owned them is gone. Dropping the
         // cache whenever a tab leaves a strip is the cheap, coarse way to make
@@ -721,7 +784,6 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.setSelectedTabs(newSet: Set2<Tab>) =
         if selectedTabsCell.value <> newSet then
             selectedTabsCell.set(newSet)
-            this.update()
     member this.isTabSelected(tab) = selectedTabsCell.value.contains(tab)
 
     // Thread-safe version for cross-thread reads (reads from volatile snapshot)
@@ -739,8 +801,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         match align, pinned with
         | TopLeft, true -> 0
         | TopLeft, false -> 1
-        | TopRight, true -> 2
-        | TopRight, false -> 3
+        | TopCenter, true -> 2
+        | TopCenter, false -> 3
+        | TopRight, true -> 4
+        | TopRight, false -> 5
 
     // Re-sort the stored list into canonical visual order while preserving the
     // relative order within each zone (stable sort).
@@ -1045,6 +1109,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.bounds = this.window.bounds
 
     member this.setPlacement(placement) =
+        this.withUpdate(fun() ->
+            this.setPlacementCore(placement))
+
+    member private this.setPlacementCore(placement) =
         showInsideCell.set(placement.showInside)
         sizeCell.set(placement.bounds.size)
         locationCell.set(placement.bounds.location)
@@ -1083,12 +1151,15 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                     | None -> ts.zorder }
         ts.render
 
-    member this.destroy() = 
+    member this.destroy() =
+        for entry in tabImages.Values do (snd entry).bitmap.Dispose()
+        tabImages.Clear()
         eventHandlersCell.value.items.iter(fun d -> d.Dispose())
         layeredWindowCell.value.iter <| fun w -> (w :?> IDisposable).Dispose()
         tooltipTimer.Dispose()
         tooltipHideTimer.Dispose()
         tooltipForm.Dispose()
+        menuFont.Dispose()
         this.window.destroy()
             
     member this.tryHit(pt) : Option<_> = this.ts.tryHit(pt)

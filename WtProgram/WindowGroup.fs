@@ -98,6 +98,15 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     // group back (the minimize<->restore oscillation). Events matching a
     // recorded expectation are consumed and ignored (group-thread only).
     let pendingMinMaxEchoes = Dictionary<IntPtr * WinEvent, DateTime>()
+    // Only inactive group members are demoted. Restore their requested
+    // TOPMOST state on activation or detach; never persist this temporary state.
+    let suspendedTopMost = HashSet<IntPtr>()
+    let parkedBackground = HashSet<IntPtr>()
+    let backgroundTransitions = HashSet<IntPtr>()
+    let mutable backgroundMinimizeEnabled = false
+    let mutable backgroundActive = IntPtr.Zero
+    let mutable backgroundGroupMinimized = false
+    let mutable pendingTabActivation : (IntPtr * bool) option = None
     // After a group restore, the siblings un-minimize asynchronously and each
     // surfaces over the window the user restored. These track that window and
     // a deadline so every sibling-surfacing event can push it back to the
@@ -138,10 +147,23 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     // Key: hwnd, Value: (shrunkWidth, shrunkHeight) that was last applied
     let marginShrunkSizes = Cell.create(Map.empty<IntPtr, (int * int)>)
 
-    member this.isSuperBarEnabled = enableSuperBar
+    [<VolatileField>]
+    let mutable superBarEnabled = enableSuperBar
+    let superBarChangedEvent = Event<unit>()
+
+    member this.isSuperBarEnabled
+        with get() = superBarEnabled
+        and set(value) =
+            if superBarEnabled <> value then
+                superBarEnabled <- value
+                superBarChangedEvent.Trigger()
+    member this.superBarChanged = superBarChangedEvent.Publish
 
     member this.init(ts:TabStrip) =
         _ts := Some(ts)
+        backgroundMinimizeEnabled <- Services.settings.getValue("minimizeBackgroundTabs") :?> bool
+        Services.settings.notifyValue "minimizeBackgroundTabs" <| fun value ->
+            this.invokeAsync <| fun() -> this.minimizeBackgroundTabs <- unbox<bool> value
 
         // Apply default setting for tab position
         let defaultPosition = Services.settings.getValue("tabPositionByDefault") :?> string
@@ -259,9 +281,34 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
 
         plugins.iter <| fun p -> p.init()
 
+    // Dialogs belong to the nearest managed owner, not the root application.
+    member private this.memberForForeground(hwnd) =
+        if this.windows.contains(hwnd) then hwnd
+        else
+            let mutable current = hwnd
+            let visited = HashSet<IntPtr>()
+            while current <> IntPtr.Zero && not(this.windows.contains(current)) && visited.Add(current) do
+                current <- WinUserApi.GetWindow(current, GetWindowConstants.GW_OWNER)
+            if this.windows.contains(current) then current else IntPtr.Zero
+
+    member private this.activationTarget(hwnd) =
+        let mutable target = hwnd
+        let visited = HashSet<IntPtr>()
+        let mutable searching = true
+        while searching && not(WinUserApi.IsWindowEnabled(target)) && visited.Add(target) do
+            // GetLastActivePopup alone returns the supplied HWND for an owned
+            // editor. GW_ENABLEDPOPUP also handles editor -> modal chains.
+            let enabledPopup = WinUserApi.GetWindow(target, GetWindowConstants.GW_ENABLEDPOPUP)
+            let popup = if enabledPopup <> IntPtr.Zero && enabledPopup <> target then enabledPopup else WinUserApi.GetLastActivePopup(target)
+            if popup <> target && popup <> IntPtr.Zero && WinUserApi.IsWindow(popup) then target <- popup
+            else searching <- false
+        target
+
     member this.foreground
         with get() = foregroundCell.value
         and set(value) =
+            let memberHwnd = this.memberForForeground(value)
+            let value = if memberHwnd <> IntPtr.Zero then memberHwnd else value
             let prev = foregroundCell.value
             if prev <> value then
                 foregroundCell.set(value)
@@ -333,17 +380,104 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
 
     member private this.withUpdate f =
         Cell.beginUpdate()
-        let result = f()
-        Cell.endUpdate()
-        result
+        try f()
+        finally Cell.endUpdate()
 
     member this.invokeSync f =
         invoker.invoke (fun() -> this.withUpdate f)
+
+    member this.minimizeBackgroundTabs
+        with get() = backgroundMinimizeEnabled
+        and set(value) = this.withUpdate <| fun() ->
+            if value <> backgroundMinimizeEnabled then
+                if not value then
+                    backgroundMinimizeEnabled <- false
+                    this.releaseBackgroundWindows()
+                    this.saveZorder()
+                else
+                    backgroundMinimizeEnabled <- true
+                    backgroundGroupMinimized <- this.windows.items.all(isMinimized)
+                    let foreground = this.os.foreground.hwnd
+                    let target = if this.windows.contains(foreground) then foreground else zorderCell.value.tryHead.def(IntPtr.Zero)
+                    if target <> IntPtr.Zero then
+                        backgroundActive <- target
+                        if not backgroundGroupMinimized then this.activateBackgroundWindow(target)
+                this.updateIsVisible()
+
+    member private this.restoreBackgroundWindow(hwnd) =
+        let window = this.os.windowFromHwnd(hwnd)
+        if backgroundTransitions.Remove(hwnd) then this.enableTransitions(hwnd)
+        if window.isWindow then
+            if window.isMinimized then
+                pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZEEND)] <- DateTime.Now
+            match placement.value with
+            | Some(bounds, wp) ->
+                let maximized = wp.showCmd = ShowWindowCommands.SW_SHOWMAXIMIZED
+                let bounds = if maximized then bounds else this.applyExeMarginForWrite(hwnd, bounds)
+                // Queue only the selected window. No per-monitor Sleep or
+                // synchronous cross-process positioning on the drag path.
+                if maximized then window.moveAsync(bounds)
+                window.setPlacement({wp with flags = wp.flags ||| WindowPlacementFlags.WPF_ASYNCWINDOWPLACEMENT})
+                if not maximized then window.moveAsync(bounds)
+            | None -> window.showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
+
+    member private this.parkBackgroundWindows(active) =
+        suppressFlashUntil <- DateTime.Now.AddSeconds(3.0)
+        // Minimizing an owner makes Windows hide all its owned windows,
+        // including the selected editor and its modal dialogs.
+        let owners = HashSet<IntPtr>()
+        let mutable owner = WinUserApi.GetWindow(active, GetWindowConstants.GW_OWNER)
+        while owner <> IntPtr.Zero && owners.Add(owner) do
+            owner <- WinUserApi.GetWindow(owner, GetWindowConstants.GW_OWNER)
+        // Parking a disabled modal owner can dismiss framework modal loops,
+        // not just hide their pixels. Keep that owner chain restored too.
+        this.windows.items.iter(fun hwnd ->
+            if not(WinUserApi.IsWindowEnabled(hwnd)) && this.activationTarget(hwnd) <> hwnd then
+                let mutable modalOwner = hwnd
+                while modalOwner <> IntPtr.Zero && owners.Add(modalOwner) do
+                    modalOwner <- WinUserApi.GetWindow(modalOwner, GetWindowConstants.GW_OWNER))
+        this.windows.items.iter(fun hwnd ->
+            if owners.Contains(hwnd) then
+                if parkedBackground.Remove(hwnd) then
+                    if backgroundTransitions.Remove(hwnd) then this.enableTransitions(hwnd)
+                    if isMinimized hwnd then
+                        pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZEEND)] <- DateTime.Now
+                        this.os.windowFromHwnd(hwnd).showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            elif hwnd <> active && not(parkedBackground.Contains(hwnd)) then
+                parkedBackground.Add(hwnd) |> ignore
+                if not(isMinimized hwnd) && backgroundTransitions.Add(hwnd) then
+                    this.disableTransitions(hwnd)
+                pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZESTART)] <- DateTime.Now
+                this.os.windowFromHwnd(hwnd).showWindowAsync(ShowWindowCommands.SW_SHOWMINNOACTIVE))
+
+    member private this.activateBackgroundWindow(hwnd) =
+        if this.windows.contains(hwnd) then
+            if backgroundActive <> hwnd && backgroundActive <> IntPtr.Zero then
+                this.saveWindowPlacement(backgroundActive)
+            let changingWindow = backgroundActive <> hwnd
+            let wasParked = parkedBackground.Remove(hwnd)
+            backgroundActive <- hwnd
+            backgroundGroupMinimized <- false
+            if changingWindow || wasParked || isMinimized hwnd then this.restoreBackgroundWindow(hwnd)
+            this.bringToTop(hwnd)
+            this.parkBackgroundWindows(hwnd)
+
+    member private this.releaseBackgroundWindows() =
+        let windows = parkedBackground |> Seq.toList
+        parkedBackground.Clear()
+        for hwnd in backgroundTransitions |> Seq.toList do this.enableTransitions(hwnd)
+        backgroundTransitions.Clear()
+        if not backgroundGroupMinimized then
+            windows |> List.iter this.restoreBackgroundWindow
 
     member this.invokeAsync f =
         invoker.asyncInvoke <| fun() -> this.withUpdate f
 
     member private this.updateIsVisible() =
+      if backgroundMinimizeEnabled then
+        let active = this.os.windowFromHwnd(backgroundActive)
+        isVisibleCell.value <- backgroundActive <> IntPtr.Zero && active.isWindow && not active.isMinimized && not active.isCloaked
+      else
         // Check if all windows in the group are cloaked (on another virtual desktop)
         // This is particularly important for UWP apps which use cloaking when switching virtual desktops
         let allWindowsCloaked =
@@ -373,7 +507,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 let b = w.bounds
                 w.isWindow && w.isMinimized.not && b.width > 0 && b.height > 0
             | None -> false
-        if topIsValid then
+        if topIsValid && not backgroundMinimizeEnabled then
             // This is the de-facto "restore follows the group" path: when the
             // user restores one window (e.g. from the taskbar), the siblings
             // are still minimized here and adjustWindowPlacement below
@@ -447,6 +581,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     // moment later (Office, Visual Studio), so one settle pass re-fronts it
     // unless focus has already moved outside the group.
     member private this.bringRestoredToFront(hwnd) =
+        this.prepareTopMostActivation(hwnd)
         let frontOrder = List2([hwnd]).appendList(zorderCell.value.where((<>) hwnd))
         this.setZorder(frontOrder)
         this.os.setZorder(frontOrder)
@@ -483,14 +618,21 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     member private this.makeTopWindowForeground() =
         match zorderCell.value.where(isMinimized >> not).tryHead with
         | Some(top) -> 
-            let window = this.os.windowFromHwnd(top)
-            window.setForeground(false)
+            let foreground = this.os.foreground.hwnd
+            let memberHwnd = this.memberForForeground(foreground)
+            // A modal dialog already has input focus; do not replace it with
+            // its disabled owner on a geometry notification or drag completion.
+            if memberHwnd <> IntPtr.Zero && foreground = memberHwnd then
+                this.os.windowFromHwnd(this.activationTarget(top)).setForeground(false)
         | None -> ()
 
     member private this.hideChildWindows() =
-        zorderCell.value.tail.where(isMinimized >> not).iter(fun window -> this.os.windowFromHwnd(window).hideOffScreen(None))
+        if not backgroundMinimizeEnabled then
+            zorderCell.value.tail.where(isMinimized >> not).iter(fun window -> this.os.windowFromHwnd(window).hideOffScreen(None))
 
-    member private this.inZorder(windows:List2<IntPtr>) = this.windows.items.sortBy(fun hwnd -> this.os.windowFromHwnd(hwnd).zorder)
+    member private this.inZorder(windows:List2<IntPtr>) =
+        let ranks = this.os.windowZorders
+        windows.sortBy(fun hwnd -> ranks.tryFind(hwnd).def(Int32.MaxValue))
 
     member private this.setZorder(newZorder:List2<_>) =
         if zorderCell.value.list <> newZorder.list then
@@ -498,7 +640,16 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             zorderCell.set(newZorder)
 
     member private this.saveZorder() =
-        this.setZorder(this.inZorder(this.windows.items))
+        if backgroundMinimizeEnabled then
+            // Membership changes are the only reason to rebuild this list;
+            // activation already explicitly moves the selected member first.
+            if zorderCell.value.length <> this.windows.count then
+                let retained = zorderCell.value.where(this.windows.contains)
+                let known = Set2(retained)
+                let added = this.windows.items.where(fun h -> not (known.contains h))
+                let order = retained.appendList(added)
+                this.setZorder(if this.windows.contains(backgroundActive) then order.moveToEnd((=) backgroundActive) else order)
+        else this.setZorder(this.inZorder(this.windows.items))
 
     member private this.setWindows(newWindows) =
         windowsCell.set(newWindows)
@@ -509,6 +660,18 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
 
     member private this.bringToTop hwnd =
         this.setZorder(zorderCell.value.moveToEnd((=)hwnd))
+
+    member private this.prepareTopMostActivation(hwnd) =
+        // BringWindowToTop cannot cross the native TOPMOST band. Do this
+        // only on activation, not on paint, mouse move or geometry updates.
+        this.windows.items.iter(fun other ->
+            if other <> hwnd then
+                let window = this.os.windowFromHwnd(other)
+                if window.isTopMost then
+                    suspendedTopMost.Add(other) |> ignore
+                    window.makeNotTopMost())
+        if suspendedTopMost.Remove(hwnd) then
+            this.os.windowFromHwnd(hwnd).makeTopMost()
 
     member this.isRenamed hwnd = Services.program.getWindowNameOverride(hwnd).IsSome
     
@@ -533,10 +696,15 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                         let icon = window.iconBig
                         let iconSize = icon.Size.Sz
                         let img = Img(size)
-                        let g = img.graphics
-                        g.FillRectangle(SolidBrush(Color.LightGray), Rect(Pt(), size).Rectangle)
-                        g.DrawIcon(icon, ((size.width - iconSize.width).float / 2.0).Int32, ((size.height - iconSize.height).float / 2.0).Int32)
-                        img
+                        try
+                            use g = img.graphics
+                            g.Clear(Color.LightGray)
+                            use iconBitmap = icon.ToBitmap()
+                            g.DrawImage(iconBitmap, ((size.width - iconSize.width).float / 2.0).Int32, ((size.height - iconSize.height).float / 2.0).Int32)
+                            img
+                        with _ ->
+                            img.bitmap.Dispose()
+                            reraise()
                     else
                         Img(Win32Helper.PrintWindow(hwnd))
                 with ex -> Img(Sz(1, 1))
@@ -669,6 +837,13 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     member this.getTabBorderColor(hwnd) = this.ts.getTabBorderColor(Tab(hwnd))
     member this.getTabBorderColorThreadSafe(hwnd) = this.ts.getTabBorderColorThreadSafe(Tab(hwnd))
 
+    member private this.singleProgramName =
+        let names = this.windows.items.map(fun h -> this.os.windowFromHwnd(h).pid.exeName.ToLowerInvariant()) |> Set2
+        if names.count = 1 then names.items.tryHead else None
+
+    member this.rememberGroupPreference(key, value) =
+        this.singleProgramName.iter(fun name -> Services.program.setGroupPreference(name,key,value))
+
     member this.setTabAlign(hwnd, alignment : TabAlign) =
         this.ts.setTabAlign(Tab(hwnd), alignment)
         Services.program.setWindowAlignment(hwnd, Some(alignment))
@@ -718,10 +893,15 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
 
     member this.placementBounds : Rect = placement.value.map(fst).def(Rect())
 
-    member private this.isTop(hwnd) = zorderCell.value.where(isMinimized >> not).tryHead = Some(hwnd)
+    member private this.isTop(hwnd) =
+        if backgroundMinimizeEnabled then hwnd = backgroundActive
+        else zorderCell.value.where(isMinimized >> not).tryHead = Some(hwnd)
 
     member private this.saveTopWindowPlacement() =
-        let window = this.os.windowFromHwnd(zorderCell.value.head)
+        if not zorderCell.value.isEmpty then this.saveWindowPlacement(zorderCell.value.head)
+
+    member private this.saveWindowPlacement(hwnd) =
+        let window = this.os.windowFromHwnd(hwnd)
         // A dying window (e.g. LibreOffice tearing down under load) reports
         // degenerate bounds: GetWindowRect fails and yields (0,0,0,0). Never
         // save such a placement — it would later be applied to every other
@@ -910,7 +1090,11 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                     // so it surfaces already below it instead of flickering on
                     // top. Ordered after the show on the target's queue.
                     if restoreFrontHwnd <> IntPtr.Zero && restoreFrontHwnd <> hwnd then
-                        window.insertAfterAsync(restoreFrontHwnd)
+                        let front = this.os.windowFromHwnd(restoreFrontHwnd)
+                        let after =
+                            if front.isTopMost && not window.isTopMost then WindowHandleTypes.HWND_TOP
+                            else restoreFrontHwnd
+                        window.insertAfterAsync(after)
                     ThreadHelper.cancelablePostBack 500 (fun() -> this.enableTransitions(hwnd)) |> ignore
                 elif window.isMinimized then
                     this.withoutTransitions(hwnd, fun() -> window.setPlacement(wp))
@@ -988,8 +1172,24 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     // Thread-safe version for cross-thread reads (reads from volatile snapshot)
     member this.isInMoveSizeThreadSafe = inMoveSizeSnapshot
 
-    member this.main(hwnd, evt) = this.invokeAsync <| fun() -> this.withUpdate <| fun() ->
+    member this.main(hwnd, evt) = this.invokeAsync(fun() -> this.processWindowEvent(hwnd,evt))
+
+    member private this.processWindowEvent(hwnd, evt) =
+        if evt = WinEvent.EVENT_SYSTEM_MINIMIZESTART && backgroundTransitions.Remove(hwnd) then
+            this.enableTransitions(hwnd)
         match evt with
+        | WinEvent.EVENT_SYSTEM_MINIMIZESTART when backgroundMinimizeEnabled ->
+            if this.windows.contains(hwnd) then
+                let ownEcho = this.consumeMinMaxEcho(hwnd, evt)
+                if hwnd = backgroundActive && isMinimized hwnd then
+                    if ownEcho then this.restoreBackgroundWindow(hwnd)
+                    else backgroundGroupMinimized <- true
+                this.updateIsVisible()
+        | WinEvent.EVENT_SYSTEM_MINIMIZEEND when backgroundMinimizeEnabled ->
+            if this.windows.contains(hwnd) then
+                if not(this.consumeMinMaxEcho(hwnd, evt)) && not(isMinimized hwnd) && pendingTabActivation.IsNone && (backgroundGroupMinimized || hwnd = backgroundActive || this.os.foreground.hwnd = hwnd) then
+                    this.tabActivate(Tab(hwnd), true)
+                this.updateIsVisible()
         | WinEvent.EVENT_SYSTEM_MINIMIZESTART ->
             if this.windows.contains(hwnd) then
                 if this.consumeMinMaxEcho(hwnd, evt) then () else
@@ -1085,6 +1285,15 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                             with _ -> false
                         this.ts.visible <- isVisibleCell.value && not hideForFullscreen
         | WinEvent.EVENT_SYSTEM_FOREGROUND ->
+            // WinEvents are queued. Resolve the current native foreground,
+            // rather than replaying an obsolete owner-activation notification.
+            let actualForeground = this.os.foreground.hwnd
+            let memberHwnd = this.memberForForeground(actualForeground)
+            let hwnd = if memberHwnd <> IntPtr.Zero then memberHwnd else actualForeground
+            if backgroundMinimizeEnabled && this.windows.contains(hwnd) && hwnd <> backgroundActive && not(isMinimized hwnd) then
+                this.activateBackgroundWindow(hwnd)
+            if this.windows.contains(hwnd) then
+                this.prepareTopMostActivation(hwnd)
             this.foreground <- hwnd
             this.saveZorder()
             // Update visibility for all groups when foreground changes
@@ -1099,7 +1308,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 if this.windows.contains(hwnd) then
                     let window = this.os.windowFromHwnd(hwnd)
                     // Make topmost for UWP apps
-                    if window.className = "ApplicationFrameWindow" then
+                    if window.isTopMost || window.className = "ApplicationFrameWindow" then
                         tsWindow.makeTopMost()
                     else
                         tsWindow.makeNotTopMost()
@@ -1110,7 +1319,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                         let window = this.os.windowFromHwnd(hwnd)
                         window.className = "ApplicationFrameWindow"
                     )
-                    if hasUWPWindow && tsWindow.isTopMost then
+                    let hasTopMost = this.windows.items.any(fun h -> (this.os.windowFromHwnd(h)).isTopMost)
+                    if hasUWPWindow && not hasTopMost && tsWindow.isTopMost then
                         tsWindow.makeNotTopMost()
                         // Insert after the new foreground window to go behind it
                         let foregroundWindow = this.os.windowFromHwnd(hwnd)
@@ -1132,13 +1342,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             let window = this.os.windowFromHwnd(hwnd)                
             // Per-event leading throttle intervals. LOCATIONCHANGE fires very frequently for
             // some apps (e.g. LibreOffice) even when the window has not actually moved, so throttle
-            // it to at most one handler call every 50ms. MINIMIZE events need to be coalesced over
-            // a full second because they can fire in rapid pairs as windows show/hide.
+            // it to at most one handler call every 50ms. Do not throttle state
+            // transitions: dropping a restore also leaves its expected echo
+            // pending, which can swallow the user's next genuine restore.
             let conflateIntervals =
                 Map.ofList [
                     WinEvent.EVENT_OBJECT_LOCATIONCHANGE, TimeSpan.FromMilliseconds(50.0)
-                    WinEvent.EVENT_SYSTEM_MINIMIZESTART,  TimeSpan.FromSeconds(1.0)
-                    WinEvent.EVENT_SYSTEM_MINIMIZEEND,    TimeSpan.FromSeconds(1.0)
                 ]
             let window = this.os.windowFromHwnd(hwnd)
             this.setWindows(this.windows.add hwnd)
@@ -1156,7 +1365,18 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                         // coalescing) don't need the trailing edge.
                         match evt with
                         | WinEvent.EVENT_OBJECT_LOCATIONCHANGE ->
-                            Helper.conflateWithTrailing interval handler
+                            // WinEvent callbacks and the queued work run on this
+                            // group's thread. Keep just one pending latest-position
+                            // read, with no timer or fixed frame cap while dragging.
+                            let queued = ref false
+                            let latestPosition() =
+                                if not !queued then
+                                    queued := true
+                                    this.invokeAsync(fun() ->
+                                        queued := false
+                                        this.processWindowEvent(hwnd,evt))
+                            let idleHandler = Helper.conflateWithTrailing interval latestPosition
+                            fun() -> if inMoveSizeSnapshot then latestPosition() else idleHandler()
                         | _ -> Helper.conflate interval handler
                     | None -> handler
                 window.setWinEventHook evt handler
@@ -1178,6 +1398,16 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             this.setTabInfo hwnd
 
             this.ts.addTab(Tab(hwnd))
+            if this.windows.count = 1 then
+                let name = window.pid.exeName.ToLowerInvariant()
+                match Services.program.getGroupPreference(name,"MergeTaskbar") with
+                | Some(value) -> this.isSuperBarEnabled <- String.Equals(value,"true",StringComparison.OrdinalIgnoreCase)
+                | None -> ()
+                match Services.program.getGroupPreference(name,"Alignment") with
+                | Some("TopLeft") -> this.setTabAlign(hwnd,TopLeft)
+                | Some("TopCenter") -> this.setTabAlign(hwnd,TopCenter)
+                | Some("TopRight") -> this.setTabAlign(hwnd,TopRight)
+                | _ -> ()
             // Restore fill color from global (persists across group transfers)
             match Services.program.getWindowFillColor(hwnd) with
             | Some(c) -> this.ts.setTabFillColor(Tab(hwnd), Some(c))
@@ -1197,7 +1427,16 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             match Services.program.getWindowAlignment(hwnd) with
             | Some(a) -> this.ts.setTabAlign(Tab(hwnd), a)
             | None -> ()
-            this.adjustWindowPlacement(hwnd)
+            if backgroundMinimizeEnabled then
+                if backgroundActive = IntPtr.Zero then
+                    backgroundActive <- hwnd
+                    this.saveWindowPlacement(hwnd)
+                if this.memberForForeground(this.os.foreground.hwnd) = hwnd && hwnd <> backgroundActive then
+                    this.activateBackgroundWindow(hwnd)
+                else this.parkBackgroundWindows(backgroundActive)
+                this.foreground <- this.os.foreground.hwnd
+                this.updateIsVisible()
+            else this.adjustWindowPlacement(hwnd)
             addedEvent.Trigger(hwnd)
 
     member this.removeWindow(hwnd) = this.withUpdate <| fun() ->
@@ -1245,6 +1484,13 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 this.applySelected(selectedTabsCell.value.remove(hwnd))
             hookCleanup.value.find(hwnd).Dispose()
             hookCleanup.map(fun hooks -> hooks.remove(hwnd))
+            if backgroundTransitions.Remove(hwnd) then this.enableTransitions(hwnd)
+            if parkedBackground.Remove(hwnd) && window.isWindow && not backgroundGroupMinimized then
+                this.restoreBackgroundWindow(hwnd)
+            if backgroundActive = hwnd then
+                backgroundActive <- zorderCell.value.tryHead.def(IntPtr.Zero)
+            if suspendedTopMost.Remove(hwnd) && window.isWindow then
+                window.makeTopMost()
             removedEvent.Trigger(hwnd)
     
     member this.activateIndex(index, force) =
@@ -1268,6 +1514,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                         
     member this.destroy() =
         if isDestroyed.value.not then
+            this.releaseBackgroundWindows()
             isDestroyed.set(true)
             this.ts.destroy()
             shellHookWindow.value.iter <| fun d -> d.Dispose()
@@ -1311,6 +1558,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
         pendingMinMaxEchoes.Remove((hwnd, evt))
 
     member this.minimizeAll() =
+        if backgroundMinimizeEnabled then backgroundGroupMinimized <- true
         suppressFlashUntil <- DateTime.Now.AddSeconds(3.0)
         zorderCell.value.reverse.iter <| fun hwnd ->
             let window = this.os.windowFromHwnd(hwnd)
@@ -1319,16 +1567,36 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 this.showWindowNoAnimation(hwnd, ShowWindowCommands.SW_SHOWMINNOACTIVE)
 
     member this.restoreAll() =
+        if backgroundMinimizeEnabled then backgroundGroupMinimized <- false
         suppressFlashUntil <- DateTime.Now.AddSeconds(3.0)
-        zorderCell.value.iter <| fun hwnd ->
+        let targets = if backgroundMinimizeEnabled then List2([backgroundActive]) else zorderCell.value
+        targets.iter <| fun hwnd ->
             let window = this.os.windowFromHwnd(hwnd)
             if window.isMinimized then
                 pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZEEND)] <- DateTime.Now
                 this.showWindowNoAnimation(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE)
         
     member this.tabActivate(Tab(hwnd), force) =
+        if backgroundMinimizeEnabled then
+            // Collapse queued key repeats / rapid clicks to the newest choice.
+            // No timer: the next group-thread dispatch applies the last request.
+            let scheduled = pendingTabActivation.IsSome
+            pendingTabActivation <- Some(hwnd, force)
+            if not scheduled then
+                this.invokeAsync <| fun() ->
+                    let next = pendingTabActivation
+                    pendingTabActivation <- None
+                    next |> Option.iter(fun (target, force) ->
+                        if this.windows.contains(target) then this.activateTabNow(Tab(target), force))
+        else this.activateTabNow(Tab(hwnd), force)
+
+    member private this.activateTabNow(Tab(hwnd), force) =
         let window = this.os.windowFromHwnd(hwnd)
         let tsWindow = this.os.windowFromHwnd(this.ts.hwnd)
+        // An explicit tab choice supersedes the recent restore-front target.
+        restoreFrontHwnd <- IntPtr.Zero
+        if backgroundMinimizeEnabled then this.activateBackgroundWindow(hwnd)
+        this.prepareTopMostActivation(hwnd)
 
         // If the tab being activated was previously in the selection set,
         // remove it — the active tab is always the implicit primary action
@@ -1341,11 +1609,16 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
         let isUWP = window.className = "ApplicationFrameWindow"
 
         // Temporarily set TOPMOST for non-UWP windows when tabs are inside to prevent flashing
-        if isTabInside && not isUWP then
+        if window.isTopMost || (isTabInside && not isUWP) then
             tsWindow.makeTopMost()
 
         window.setForegroundOrRestore(force)
         window.bringToTop()
+        let inputTarget = this.activationTarget(hwnd)
+        if inputTarget <> hwnd then
+            let popup = this.os.windowFromHwnd(inputTarget)
+            popup.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            popup.setForeground(force)
         // Update WindowGroup's internal zorder state immediately
         this.bringToTop(hwnd)
 
@@ -1356,7 +1629,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 this.invokeAsync <| fun() ->
                     if not (this.windows.items.any(fun hwnd ->
                         let w = this.os.windowFromHwnd(hwnd)
-                        w.className = "ApplicationFrameWindow"
+                        w.isTopMost || w.className = "ApplicationFrameWindow"
                     )) then
                         tsWindow.makeNotTopMost()
             ).Dispose()

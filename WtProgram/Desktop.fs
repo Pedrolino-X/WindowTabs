@@ -16,7 +16,7 @@ type GroupInfo(enableSuperBar) as this =
             None // MouseScrollPlugin disabled - mouse wheel tab switching removed
             (if enableCtrlNumberHotKey then Some(NumericTabHotKeyPlugin().cast<IPlugin>()) else None)
             Some(HideTabsOnInactiveGroupPlugin().cast<IPlugin>())
-            (if enableSuperBar then Some(SuperBarPlugin().cast<IPlugin>()) else None)
+            Some(SuperBarPlugin().cast<IPlugin>())
             ])
         let plugins = plugins.choose(id)
 
@@ -79,6 +79,9 @@ type GroupInfo(enableSuperBar) as this =
         member x.pinTab(hwnd) = this.invokeGroup <| fun() -> _group.pinTab(hwnd)
         member x.isPinnedThreadSafe(hwnd) = _group.isPinnedThreadSafe(hwnd)
         member x.isInMoveSizeThreadSafe = _group.isInMoveSizeThreadSafe
+        member x.combineTaskbarIcons
+            with get() = _group.isSuperBarEnabled
+            and set(value) = this.invokeGroup <| fun() -> _group.isSuperBarEnabled <- value
         member x.setTabFillColor(hwnd, color) = this.invokeGroup <| fun() -> _group.setTabFillColor(hwnd, color)
         member x.getTabFillColorThreadSafe(hwnd) = _group.getTabFillColorThreadSafe(hwnd)
         member x.setTabUnderlineColor(hwnd, color) = this.invokeGroup <| fun() -> _group.setTabUnderlineColor(hwnd, color)
@@ -233,7 +236,7 @@ type Desktop(notify:IDesktopNotification) as this =
                 Services.program.markRecentlyPlaced(hwnd :: dragInfo.selectedHwnds)
                 Services.program.suspendTabMonitoring()
                 try
-                    let newGroup = this.createGroup(false)
+                    let newGroup = this.createGroup(Services.settings.getValue("combineTaskbarIconsByDefault") :?> bool)
                     newGroup.addWindow(hwnd, false)
                     for selHwnd in dragInfo.selectedHwnds do
                         if not (newGroup.windows.contains((=) selHwnd)) then

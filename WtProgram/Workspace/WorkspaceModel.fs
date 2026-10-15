@@ -1,4 +1,4 @@
-namespace Bemo
+﻿namespace Bemo
 open System
 open System.Collections.Generic
 open System.Drawing
@@ -358,7 +358,7 @@ type WorkspaceModel() as this =
                 windows.iter <| fun hwnd -> os.windowFromHwnd(hwnd).setPlacement(groupInfo?placement)
             os.setZorder(windows)
 
-            let group = Services.desktop.createGroup(false)
+            let group = Services.desktop.createGroup(Services.settings.getValue("combineTaskbarIconsByDefault") :?> bool)
             windows.iter <| fun hwnd -> group.addWindow(hwnd, false)
 
         Services.program.resumeTabMonitoring()

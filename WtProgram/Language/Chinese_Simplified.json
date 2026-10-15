@@ -1,4 +1,5 @@
-{
+﻿{
+  "CombineGroupTaskbarIcons": "合并当前组任务栏图标",
   "Programs": "程序",
   "Refresh": "刷新",
   "ShowAllSettings": "显示所有设置",
@@ -146,6 +147,8 @@
   "TabAlignMenu": "标签页对齐",
   "AlignAllTopLeft": "将所有标签页靠左对齐",
   "AlignAllTopRight": "将所有标签页靠右对齐",
+  "AlignAllTopCenter": "将所有标签页居中对齐",
+  "MinimizeBackgroundTabs": "后台标签最小化（所有组）",
   "AlignThisTabLeft": "将此标签页靠左对齐",
   "AlignThisTabRight": "将此标签页靠右对齐",
   "AlignSelectedTabsLeftFormat": "将已选{0}个标签页靠左对齐",
@@ -229,6 +232,6 @@
   "UpdateAvailableFormat": "有新版本可用：version {0}\n现在安装吗？",
   "UpdateCheckFailed": "检查更新失败。",
   "UpdateDownloading": "正在下载更新...",
-  "UpdateDownloadFailed": "下载更新失败。"
-
+  "UpdateDownloadFailed": "下载更新失败。",
+  "CombineTaskbarIconsByDefault": "默认合并新组任务栏图标"
 }

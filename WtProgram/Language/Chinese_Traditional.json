@@ -1,4 +1,5 @@
-{
+﻿{
+  "CombineGroupTaskbarIcons": "合併目前群組工作列圖示",
   "Programs": "程式",
   "Refresh": "重新整理",
   "ShowAllSettings": "顯示所有設定",
@@ -146,6 +147,8 @@
   "TabAlignMenu": "分頁對齊",
   "AlignAllTopLeft": "將所有分頁靠左對齊",
   "AlignAllTopRight": "將所有分頁靠右對齊",
+  "AlignAllTopCenter": "將所有標籤頁置中對齊",
+  "MinimizeBackgroundTabs": "背景標籤最小化（所有群組）",
   "AlignThisTabLeft": "將此分頁靠左對齊",
   "AlignThisTabRight": "將此分頁靠右對齊",
   "AlignSelectedTabsLeftFormat": "將已選{0}個分頁靠左對齊",
@@ -229,6 +232,6 @@
   "UpdateAvailableFormat": "有新版本可用：version {0}\n現在安裝嗎？",
   "UpdateCheckFailed": "檢查更新失敗。",
   "UpdateDownloading": "正在下載更新...",
-  "UpdateDownloadFailed": "下載更新失敗。"
-
+  "UpdateDownloadFailed": "下載更新失敗。",
+  "CombineTaskbarIconsByDefault": "預設合併新群組工作列圖示"
 }

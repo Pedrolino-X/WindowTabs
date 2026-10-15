@@ -36,11 +36,11 @@ type TaskBarButton(info) as this =
     let Cell = CellScope()
     let _os = OS()
     let invoker = Invoker()
-    let mutable overlayInitialized = false
+    let overlayIcon = lazy(Services.openIcon("Bemo.ico"))
     let taskbar = _os.getTaskbar().Value
     let infoCell = Cell.create(None)
     let tabWindowsCell = Cell.create(Map2())
-    let windowsToDispose = Cell.create(Set2())
+    let windowsToDispose = Cell.create(Map2<IntPtr, IDisposable>())
     let appId = Guid.NewGuid().ToString()
     let addTab hwnd =
         taskbar.AddTab(hwnd)
@@ -150,7 +150,7 @@ type TaskBarButton(info) as this =
             tabOrder.iter <| fun tabWindow ->  setTabOrder(tabWindow.window.hwnd, IntPtr.Zero)
 
         invoker.asyncInvoke <| fun() ->
-            let hicon = Services.openIcon("Bemo.ico").Handle
+            let hicon = overlayIcon.Value.Handle
             taskbar.SetOverlayIcon(this.window.hwnd, hicon, "WindowTabs")
        
     member this.tabWindow key = tabWindowsCell.value.find(key).window
@@ -168,16 +168,25 @@ type TaskBarButton(info) as this =
             | _ -> dwmWindow.handler(m)
 
         let window = this.os.createWindow wndProc dwmWindow.style dwmWindow.exStyle 
-        windowsToDispose.map(fun s -> s.add(window:?>IDisposable))
+        windowsToDispose.map(fun s -> s.add window.hwnd (window:?>IDisposable))
         this.os.windowFromHwnd(window.hwnd)
+
+    member this.releaseWindow(hwnd) =
+        match windowsToDispose.value.tryFind(hwnd) with
+        | Some window ->
+            windowsToDispose.map(fun s -> s.remove(hwnd))
+            window.Dispose()
+        | None -> ()
 
     interface IDisposable with
         member this.Dispose() =
-            this.window.destroy()
+            this.releaseWindow(this.window.hwnd)
             tabWindowsCell.value.items.iter <| fun (tab, tabWindow) ->
                 tabWindow.Dispose()
             tabWindowsCell.set(Map2())
-            windowsToDispose.value.items.iter <| fun d -> d.Dispose()
+            windowsToDispose.value.keys.iter(this.releaseWindow)
+            (invoker :> IDisposable).Dispose()
+            if overlayIcon.IsValueCreated then overlayIcon.Value.Dispose()
 
 and TaskbarTab(parent:TaskBarButton, config,size) =
     let os = OS()
@@ -198,16 +207,21 @@ and TaskbarTab(parent:TaskBarButton, config,size) =
                 | WindowMessages.WM_DWMSENDICONICTHUMBNAIL ->
                     let msgWindow = os.windowFromHwnd(msg.hwnd)
                     config().preview(true).iter <| fun img ->
-                        msgWindow.dwmSetIconicThumbnail(img.resize(msg.lParam.size))
-                    GC.Collect()
+                        use sourceBitmap = img.bitmap
+                        let resized = img.resize(msg.lParam.size)
+                        use resizedBitmap = resized.bitmap
+                        msgWindow.dwmSetIconicThumbnail(resized)
                     msg.def()
                 | WindowMessages.WM_DWMSENDICONICLIVEPREVIEWBITMAP ->
                     let msgWindow = os.windowFromHwnd(msg.hwnd)
                     //DwmSetIconic fails if the image is larger than the preview window, windows can't be larger than
                     //a certain size determined by the workspace - this happens when the window is maximized
                     config().preview(false).iter <| fun img ->
-                        msgWindow.dwmSetIconicLivePreview(img.crop(size()))
-                    GC.Collect()
+                        use sourceBitmap = img.bitmap
+                        let cropped = img.crop(size())
+                        try msgWindow.dwmSetIconicLivePreview(cropped)
+                        finally
+                            if not(Object.ReferenceEquals(img, cropped)) then cropped.bitmap.Dispose()
                     msg.def()
                 // a ghost window is shown during peek preview if this isn't here
                 | WindowMessages.WM_NCCALCSIZE -> 0
@@ -217,18 +231,18 @@ and TaskbarTab(parent:TaskBarButton, config,size) =
     member this.window : Window = _window
     member this.invalidate() = this.window.dwmInvalidateIconicBitmaps()
     member this.Dispose() =
-        _window.destroy() 
+        parent.releaseWindow(_window.hwnd) 
 
 type SuperBarPlugin() as this =
     let _os = OS()
 
-    let _taskbar = _os.getTaskbar().Value
+    let _taskbar = lazy(_os.getTaskbar().Value)
 
     let mutable taskbarButton = null
 
     member this.os = _os
     
-    member this.taskbar = _taskbar
+    member this.taskbar = _taskbar.Value
 
     member this.wtGroup = Services.get<WindowGroup>()
     
@@ -237,6 +251,7 @@ type SuperBarPlugin() as this =
     member this.invokeAsync(f) = this.wtGroup.invokeAsync(f)
 
     member this.tabActivate(hwnd, force) = this.wtGroup.tabActivate(hwnd, force)
+    member private this.tabKey(Tab(hwnd)) = hwnd.ToInt64().ToString()
 
     member this.foregroundTab = this.wtGroup.foregroundTab
 
@@ -247,7 +262,7 @@ type SuperBarPlugin() as this =
 
     member this.updateTaskbar() =
         if this.os.isWin7OrHigher then
-            if this.zorder.length = 1 then
+            if not this.wtGroup.isSuperBarEnabled || this.zorder.length <= 1 then
                 match taskbarButton with
                 | null -> ()
                 | button ->
@@ -272,21 +287,26 @@ type SuperBarPlugin() as this =
                         else
                             window.minimize()
                     tabs = this.ts.visualOrder.map <| fun tab ->
-                        tab.GetHashCode().ToString(), {
+                        this.tabKey(tab), {
                             close = fun() -> 
                                 let (Tab(hwnd)) = tab
                                 this.os.windowFromHwnd(hwnd).close()
                             preview = fun(isThumbnail) -> 
                                 try
                                     let bmpTs = this.ts.renderTs(Some(tab))
+                                    use stripBitmap = bmpTs.bitmap
                                     let bmpHwnd = this.ts.tabInfo(tab).preview()
+                                    use windowBitmap = bmpHwnd.bitmap
                                     let previewBmp = Img(Sz(previewBounds.width, previewBounds.height))
-                                    let previewGfx = previewBmp.graphics
-                                    previewGfx.FillRectangle(new SolidBrush(Color.Transparent), Rectangle(Point.Empty, previewBounds.size.Size))
-                                    previewGfx.DrawImage(bmpHwnd.bitmap, this.ts.contentBounds.location.sub(previewBounds.location).Point)
-                                    previewGfx.DrawImage(bmpTs.bitmap, this.ts.bounds.location.sub(previewBounds.location).Point)
-                                    previewGfx.Dispose()
-                                    Some(previewBmp)
+                                    try
+                                        use previewGfx = previewBmp.graphics
+                                        previewGfx.Clear(Color.Transparent)
+                                        previewGfx.DrawImage(bmpHwnd.bitmap, this.ts.contentBounds.location.sub(previewBounds.location).Point)
+                                        previewGfx.DrawImage(bmpTs.bitmap, this.ts.bounds.location.sub(previewBounds.location).Point)
+                                        Some(previewBmp)
+                                    with _ ->
+                                        previewBmp.bitmap.Dispose()
+                                        reraise()
                                 with _ -> None
                             activate = fun() -> this.invokeAsync <| fun() ->
                                 this.tabActivate(tab, false)
@@ -312,24 +332,24 @@ type SuperBarPlugin() as this =
                         
 
                 match this.foregroundTab with
-                | Some(tab) ->
+                | Some(tab) when this.ts.visualOrder.contains((=) tab) ->
                     this.taskbar.ActivateTab(button.window.hwnd)
-                    this.taskbar.SetTabActive(button.tabWindow(tab.GetHashCode().ToString()).hwnd, button.window.hwnd, 0)
+                    this.taskbar.SetTabActive(button.tabWindow(this.tabKey(tab)).hwnd, button.window.hwnd, 0)
                 | _ -> ()
 
     member this.onForegroundChanged() =
         this.updateTaskbar()
 
     member this.onAdded(hwnd) =
-        this.updateTaskbar()
+        this.onZorderChanged()
 
     member this.onRemoved(hwnd) =
-        this.updateTaskbar()
-        this.showInTaskbar(hwnd, true)
+        this.onZorderChanged()
+        if this.wtGroup.isSuperBarEnabled then this.showInTaskbar(hwnd, true)
             
-    member this.onFlash(hwnd, flash) =
+    member this.onFlash(tab:Tab, flash) =
         if taskbarButton <> null then
-            let tabHwnd = taskbarButton.tabWindow(hwnd.GetHashCode().ToString()).hwnd
+            let tabHwnd = taskbarButton.tabWindow(this.tabKey(tab)).hwnd
             let flags, count = if flash then (FlashWindowExFlags.FLASHW_TRAY, 1) else (FlashWindowExFlags.FLASHW_STOP, 0)
             Win32Helper.FlashWindow(tabHwnd, flags, 0).ignore
             Win32Helper.FlashWindow(taskbarButton.window.hwnd, flags, 0).ignore
@@ -339,11 +359,13 @@ type SuperBarPlugin() as this =
         if taskbarButton <> null then taskbarButton.invalidate()
 
     member this.onZorderChanged() =
-        if this.zorder.count = 1 then
-            this.showInTaskbar(this.zorder.head, true)
-        else
-            this.zorder.iter <| fun hwnd -> this.showInTaskbar(hwnd, false)
+        let wasCombined = taskbarButton <> null
+        // Create/update the replacement button before removing native buttons.
         this.updateTaskbar()
+        if this.wtGroup.isSuperBarEnabled && taskbarButton <> null then
+            this.zorder.iter <| fun hwnd -> this.showInTaskbar(hwnd, false)
+        elif wasCombined || this.wtGroup.isSuperBarEnabled then
+            this.zorder.iter <| fun hwnd -> this.showInTaskbar(hwnd, true)
 
     member this.onTabMoved(tab, index) =
         this.updateTaskbar()
@@ -355,6 +377,7 @@ type SuperBarPlugin() as this =
 
     interface IPlugin with
         member x.init() =
+            this.wtGroup.superBarChanged.Add this.onZorderChanged
             this.wtGroup.foregroundChanged.Add this.onForegroundChanged
             this.wtGroup.added.Add this.onAdded
             this.wtGroup.removed.Add this.onRemoved

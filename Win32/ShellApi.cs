@@ -7,6 +7,38 @@ using System.Runtime.CompilerServices;
 
 namespace Bemo
 {
+    // Only the IOleWindow prefix of IShellBrowser is needed to identify the
+    // visible Explorer native tab; no undocumented vtable offsets/messages.
+    public static class ExplorerBrowser
+    {
+        [ComImport, Guid("6d5140c1-7436-11ce-8034-00aa006009fa"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IServiceProvider
+        {
+            [PreserveSig] int QueryService(ref Guid service, ref Guid iid,
+                [MarshalAs(UnmanagedType.Interface)] out object result);
+        }
+        [ComImport, Guid("000214e2-0000-0000-c000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IShellBrowserWindow
+        {
+            [PreserveSig] int GetWindow(out IntPtr hwnd);
+        }
+        public static IntPtr GetTabWindow(object automationWindow)
+        {
+            object browser = null;
+            try
+            {
+                Guid service = new Guid("4c96be40-915c-11cf-99d3-00aa004ae837");
+                Guid iid = new Guid("000214e2-0000-0000-c000-000000000046");
+                var provider = automationWindow as IServiceProvider;
+                if (provider == null || provider.QueryService(ref service, ref iid, out browser) < 0)
+                    return IntPtr.Zero;
+                IntPtr hwnd;
+                return ((IShellBrowserWindow)browser).GetWindow(out hwnd) >= 0 ? hwnd : IntPtr.Zero;
+            }
+            catch (COMException) { return IntPtr.Zero; }
+            finally { if (browser != null && Marshal.IsComObject(browser)) Marshal.ReleaseComObject(browser); }
+        }
+    }
 	#region Structures
     [StructLayout(LayoutKind.Sequential)]
     public struct SHFILEINFO

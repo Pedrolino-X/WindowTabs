@@ -508,6 +508,8 @@ type Settings(isStandAlone) as this =
                         includedPaths = Set2(settingsJson.getStringArray("IncludedPaths").def(List2()))
                         excludedPaths = Set2(settingsJson.getStringArray("ExcludedPaths").def(List2()))
                         autoGroupingPaths = Set2(settingsJson.getStringArray("AutoGroupingPaths").def(List2()))
+                        autoGroupingExcludedPaths = Set2(settingsJson.getStringArray("AutoGroupingExcludedPaths").def(List2()))
+                        combineTaskbarIconsByDefault = settingsJson.getBool("CombineTaskbarIconsByDefault").def(true)
                         licenseKey = settingsJson.getString("LicenseKey").def("")
                         ticket = settingsJson.getString("Ticket")
                         runAtStartup = settingsJson.getBool("RunAtStartup").def(hasExistingSettings.not)
@@ -540,6 +542,7 @@ type Settings(isStandAlone) as this =
                                 | _ -> "never"
                         hideTabsDelayMilliseconds = settingsJson.getInt32("HideTabsDelayMilliseconds").def(3000)
                         hideTabsOnFullscreen = settingsJson.getBool("HideTabsOnFullscreen").def(true)
+                        minimizeBackgroundTabs = settingsJson.getBool("MinimizeBackgroundTabs").def(true)
                         snapTabHeightMargin = settingsJson.getBool("SnapTabHeightMargin").def(false)
                         changeTabPositionOnSnap = settingsJson.getString("ChangeTabPositionOnSnap").def("change")
                         version = settingsJson.getString("Version").def(String.Empty)
@@ -569,6 +572,8 @@ type Settings(isStandAlone) as this =
                         includedPaths = Set2(List2())
                         excludedPaths = Set2(List2())
                         autoGroupingPaths = Set2(List2())
+                        autoGroupingExcludedPaths = Set2(List2())
+                        combineTaskbarIconsByDefault = true
                         licenseKey = ""
                         ticket = None
                         runAtStartup = false
@@ -580,6 +585,7 @@ type Settings(isStandAlone) as this =
                         hideTabsWhenDownByDefault = "never"
                         hideTabsDelayMilliseconds = 3000
                         hideTabsOnFullscreen = true
+                        minimizeBackgroundTabs = true
                         snapTabHeightMargin = false
                         changeTabPositionOnSnap = "change"
                         version = String.Empty
@@ -611,11 +617,14 @@ type Settings(isStandAlone) as this =
             settingsJson.setString("HideTabsWhenDownByDefault", settings.hideTabsWhenDownByDefault)
             settingsJson.setInt32("HideTabsDelayMilliseconds", settings.hideTabsDelayMilliseconds)
             settingsJson.setBool("HideTabsOnFullscreen", settings.hideTabsOnFullscreen)
+            settingsJson.setBool("MinimizeBackgroundTabs", settings.minimizeBackgroundTabs)
             settingsJson.setBool("SnapTabHeightMargin", settings.snapTabHeightMargin)
             settingsJson.setString("ChangeTabPositionOnSnap", settings.changeTabPositionOnSnap)
             settingsJson.setStringArray("IncludedPaths", settings.includedPaths.items)
             settingsJson.setStringArray("ExcludedPaths", settings.excludedPaths.items)
             settingsJson.setStringArray("AutoGroupingPaths", settings.autoGroupingPaths.items)
+            settingsJson.setStringArray("AutoGroupingExcludedPaths", settings.autoGroupingExcludedPaths.items)
+            settingsJson.setBool("CombineTaskbarIconsByDefault", settings.combineTaskbarIconsByDefault)
             let appearanceObject =
                 let appearance = settings.tabAppearance
                 let obj = JObject()

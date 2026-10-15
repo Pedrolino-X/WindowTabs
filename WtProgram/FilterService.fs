@@ -32,22 +32,29 @@ type FilterService() as this =
         Win32Helper.IntPtrAnd(window.styleEx, IntPtr(WindowsExtendedStyles.WS_EX_TOOLWINDOW)) = IntPtr.Zero &&
         Win32Helper.IntPtrAnd(window.style, style) = style
     
-    member this.isAppWindow (window:Window) =
+    member private this.isAppWindowCore (window:Window, existing:bool) =
         let tests = List2([
             fun() -> window.pid.canQueryProcess
             fun() -> this.isAppWindowStyle(window)
             fun() -> window.pid.isCurrentProcess.not
             fun() -> window.isWindow
-            fun() -> window.isVisibleOnScreen
+            fun() -> window.isVisibleOnScreen || (existing && window.isMinimized)
             fun() -> this.isValidOwner(window)
             //Win32 Dialogue class
             fun() -> window.className <> "#32770"
             //ApplicationFrameWindow check for modern Windows apps/Explorer
             fun() -> window.className <> "ApplicationFrameWindow" || not(String.IsNullOrEmpty window.text)
             fun() -> this.isBanned(window).not
-            fun() -> this.isOnScreenOrMinimized(window)
+            fun() -> existing || this.isOnScreenOrMinimized(window)
             ])
-        tests.all(fun pred -> pred()) 
+        tests.all(fun pred -> pred())
+
+    member this.isAppWindow(window:Window) = this.isAppWindowCore(window, false)
+
+    // Off-screen parking during resize/restore is not a membership change.
+    // Discovery still requires on-screen geometry; existing members do not.
+    member this.isRetainableWindow(window:Window) =
+        this.getIsTabbingEnabledForProcess(window.pid.processPath) && this.isAppWindowCore(window, true)
 
     member this.isValidOwner (window:Window) =
         let owner = window.parent
@@ -82,6 +89,9 @@ type FilterService() as this =
         member x.isTabbableWindow(hwnd) =
             let window = os.windowFromHwnd(hwnd)
             this.isTabbableWindow(window)
+
+        member x.isRetainableWindow(hwnd) =
+            this.isRetainableWindow(os.windowFromHwnd(hwnd))
 
         member x.isTabbingEnabledForAllProcessesByDefault
             with get() = this.isTabbingEnabledForAllProcessesByDefault

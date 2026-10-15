@@ -48,6 +48,7 @@ and TabDirection =
 and TabAlign =
     | TopLeft
     | TopRight
+    | TopCenter
 
 and TabDock =
     | TabDockTop

@@ -205,9 +205,17 @@ type OS() as this=
     member this.setZorder(hwnds:List2<IntPtr>) =
         let hdswp = ref(WinUserApi.BeginDeferWindowPos(hwnds.length))
         hwnds.pairwise.iter <| fun (hwndPrev, hwnd) ->
+            // Inserting relative to a window in the other band changes
+            // WS_EX_TOPMOST as a side effect. Reordering must preserve it.
+            let topMost = this.windowFromHwnd(hwnd).isTopMost
+            let previousTopMost = this.windowFromHwnd(hwndPrev).isTopMost
+            let insertAfter =
+                if topMost = previousTopMost then hwndPrev
+                elif topMost then WindowHandleTypes.HWND_TOPMOST
+                else WindowHandleTypes.HWND_TOP
             hdswp := WinUserApi.DeferWindowPos(!hdswp,
                 hwnd,
-                hwndPrev, 0, 0, 0, 0,
+                insertAfter, 0, 0, 0, 0,
                 SetWindowPosFlags.SWP_NOOWNERZORDER |||
                 SetWindowPosFlags.SWP_NOMOVE |||
                 SetWindowPosFlags.SWP_NOSIZE |||
@@ -271,14 +279,14 @@ and
         if os.isWin7OrHigher then
             let mutable ptClient = POINT(0, 0)
             let hbitmap = image.hbitmap
-            DwmApi.DwmSetIconicLivePreviewBitmap(hwnd, hbitmap, ref ptClient, 0) |> ignore
-            WinGdiApi.DeleteObject(hbitmap) |> ignore
+            try DwmApi.DwmSetIconicLivePreviewBitmap(hwnd, hbitmap, ref ptClient, 0) |> ignore
+            finally WinGdiApi.DeleteObject(hbitmap) |> ignore
 
     member this.dwmSetIconicThumbnail (image:Img) =
         if os.isWin7OrHigher then
             let hbitmap = image.hbitmap
-            DwmApi.DwmSetIconicThumbnail(hwnd, hbitmap, 0) |> ignore
-            WinGdiApi.DeleteObject(hbitmap) |> ignore
+            try DwmApi.DwmSetIconicThumbnail(hwnd, hbitmap, 0) |> ignore
+            finally WinGdiApi.DeleteObject(hbitmap) |> ignore
 
     member this.style = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_STYLE)
     member this.styleEx = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_EXSTYLE)

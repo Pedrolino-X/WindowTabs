@@ -3,6 +3,7 @@ open System
 open System.Drawing
 
 type ISprite =
+    // Sprite implementations return a newly allocated image owned by the caller.
     abstract member image : Img
     abstract member children : List2<Pt * ISprite>
    
@@ -10,13 +11,18 @@ type ISprite =
 module Sprite = 
     type ISprite with
         member this.render : Img =
-            let image = this.image.clone()
-            let gr = image.graphics
-            let draw (childLocation:Pt, child:ISprite) = 
-                let image = child.render
-                do  gr.DrawImageUnscaled(image.bitmap, childLocation.Point) 
-            do  this.children.reverse.iter draw
-            image
+            let image = this.image
+            try
+                use gr = image.graphics
+                let draw (childLocation:Pt, child:ISprite) =
+                    let childImage = child.render
+                    use childBitmap = childImage.bitmap
+                    gr.DrawImageUnscaled(childBitmap, childLocation.Point)
+                this.children.reverse.iter draw
+                image
+            with _ ->
+                image.bitmap.Dispose()
+                reraise()
 
         member this.tryHit(pt:Pt, path:List2<ISprite>) =
             let path = path.prepend(this)
@@ -26,7 +32,9 @@ module Sprite =
             match hitPath with
             | Some(path) -> Some(path)
             | None ->
-                if this.image.containsPoint(pt) 
+                let image = this.image
+                use bitmap = image.bitmap
+                if image.containsPoint(pt) 
                 then Some(path)
                 else None
 

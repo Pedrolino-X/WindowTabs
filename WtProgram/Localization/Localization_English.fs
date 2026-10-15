@@ -1,7 +1,8 @@
-namespace Bemo
+﻿namespace Bemo
 
 module Localization_English =
     let strings = dict [
+        ("CombineGroupTaskbarIcons", "Combine this group's taskbar icons")
         ("Programs", "Programs")
         ("Refresh", "Refresh")
         ("ShowAllSettings", "Show all settings")
@@ -67,6 +68,7 @@ module Localization_English =
         ("HideTabsOnClick", "Hide when clicking active tab icon")
 
         ("HideTabsOnFullscreen", "Hide tabs when window is fullscreen")
+        ("CombineTaskbarIconsByDefault", "Combine taskbar icons for new groups by default")
         ("SnapTabHeightMargin", "Add tab height margin when snapping")
         ("NextTab", "Next Tab")
         ("PrevTab", "Previous Tab")
@@ -149,6 +151,8 @@ module Localization_English =
         ("TabAlignMenu", "Tab Alignment")
         ("AlignAllTopLeft", "Align all tabs to Left")
         ("AlignAllTopRight", "Align all tabs to Right")
+        ("AlignAllTopCenter", "Center all tabs")
+        ("MinimizeBackgroundTabs", "Minimize background tabs (all groups)")
         ("AlignThisTabLeft", "Align this tab to Left")
         ("AlignThisTabRight", "Align this tab to Right")
         ("AlignSelectedTabsLeftFormat", "Align {0} selected tabs to Left")

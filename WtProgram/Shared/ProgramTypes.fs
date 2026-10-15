@@ -23,6 +23,8 @@ type SettingsRec = {
     includedPaths: Set2<string>
     excludedPaths: Set2<string>
     autoGroupingPaths : Set2<string>
+    autoGroupingExcludedPaths : Set2<string>
+    combineTaskbarIconsByDefault: bool
     version: string
     tabAppearance: TabAppearanceInfo
     runAtStartup: bool
@@ -34,6 +36,7 @@ type SettingsRec = {
     hideTabsWhenDownByDefault: string
     hideTabsDelayMilliseconds: int
     hideTabsOnFullscreen: bool
+    minimizeBackgroundTabs: bool
     snapTabHeightMargin: bool
     // "change": on a left/right snap, re-align every tab of a uniformly-aligned
     // group to match the snap direction. "nochange": leave tab alignment alone.
@@ -55,6 +58,7 @@ type IFilterService =
     abstract member isAppWindow : IntPtr -> bool
     abstract member isAppWindowStyle : IntPtr -> bool
     abstract member isTabbableWindow : IntPtr -> bool
+    abstract member isRetainableWindow : IntPtr -> bool
     abstract member isTabbingEnabledForAllProcessesByDefault : bool with get, set
     abstract member setIsTabbingEnabledForProcess : string -> bool -> unit
     abstract member getIsTabbingEnabledForProcess : string -> bool
@@ -103,6 +107,8 @@ type IProgram =
     abstract member setWindowAlignment : IntPtr * TabAlign option -> unit
     abstract member getWindowAlignment : IntPtr -> TabAlign option
     abstract member appWindows : List2<IntPtr>
+    abstract member getGroupPreference : string * string -> string option
+    abstract member setGroupPreference : string * string * string -> unit
     abstract member getAutoGroupingEnabled : string -> bool
     abstract member setAutoGroupingEnabled : string -> bool -> unit
     abstract member getCategoryEnabled : string * int -> bool
@@ -130,7 +136,7 @@ type IProgram =
     abstract member setDisabled : bool -> unit
     abstract member isShuttingDown : bool
     abstract member saveTabGroupsBeforeExit : unit -> unit
-    abstract member launchNewWindow : IntPtr -> IntPtr -> string -> unit
+    abstract member launchNewWindow : IntPtr -> IntPtr -> string -> string -> unit
     // Launch a process as a standalone tab group (bypassing auto-grouping).
     // postAction runs after the new window has been added to its new group.
     abstract member launchStandaloneWindow : string -> (IntPtr -> unit) -> unit
@@ -156,6 +162,7 @@ type IGroup =
     abstract member destroy: unit -> unit
     abstract member perGroupTabPositionValue: string with get, set
     abstract member snapTabHeightMargin: bool with get, set
+    abstract member combineTaskbarIcons: bool with get, set
     abstract member isPinned: IntPtr -> bool
     abstract member pinTab: IntPtr -> unit
     abstract member isPinnedThreadSafe: IntPtr -> bool

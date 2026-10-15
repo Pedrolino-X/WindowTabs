@@ -21,6 +21,17 @@ packages/
 CLAUDE*.md
 .agents/
 AGENTS.md
+/.tools/fsharp/
+/.tools/compat/
+/WtProgram/WtProgram.compat.fsproj
+/Tests/bin/
+/Tests/*.exe
+/Tests/*.dll
+/Tests/*.exe.config
+/Tests/*.txt
+/Tests/*.png
+/Tests/Explorer */
+/behavior-preview.png
 
 Tools/DisplayChangeSim/DisplayChangeSim.exe
 

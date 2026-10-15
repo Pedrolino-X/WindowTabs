@@ -1,3 +1,11 @@
+# WindowTabs — repair and performance fork
+
+[中文说明、编译和修复列表](README_Chinese.md) · [Download this fork](https://github.com/Pedrolino-X/WindowTabs/releases)
+
+This fork preserves the original UI and workflow while fixing window lifecycle, focus, resource ownership and multi-window performance. Based on standard-software's ss_2026.08.28 source. The upstream documentation follows below.
+
+---
+
 <img src="README_Image/LargeIcon.png" width="60" height="60" alt="icon" align="left" />
 
 # WindowTabs
