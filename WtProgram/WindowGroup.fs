@@ -102,6 +102,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
     // TOPMOST state on activation or detach; never persist this temporary state.
     let suspendedTopMost = HashSet<IntPtr>()
     let parkedBackground = HashSet<IntPtr>()
+    let fullscreenWindows = HashSet<IntPtr>()
     let backgroundTransitions = HashSet<IntPtr>()
     let mutable backgroundMinimizeEnabled = false
     let mutable backgroundActive = IntPtr.Zero
@@ -408,18 +409,24 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
         let window = this.os.windowFromHwnd(hwnd)
         if backgroundTransitions.Remove(hwnd) then this.enableTransitions(hwnd)
         if window.isWindow then
+            if not window.isMinimized then
+                if window.isFullscreen && not window.isMaximized then fullscreenWindows.Add(hwnd) |> ignore
+                else fullscreenWindows.Remove(hwnd) |> ignore
             if window.isMinimized then
                 pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZEEND)] <- DateTime.Now
-            match placement.value with
-            | Some(bounds, wp) ->
-                let maximized = wp.showCmd = ShowWindowCommands.SW_SHOWMAXIMIZED
-                let bounds = if maximized then bounds else this.applyExeMarginForWrite(hwnd, bounds)
-                // Queue only the selected window. No per-monitor Sleep or
-                // synchronous cross-process positioning on the drag path.
-                if maximized then window.moveAsync(bounds)
-                window.setPlacement({wp with flags = wp.flags ||| WindowPlacementFlags.WPF_ASYNCWINDOWPLACEMENT})
-                if not maximized then window.moveAsync(bounds)
-            | None -> window.showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            if fullscreenWindows.Contains(hwnd) then
+                window.showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            else
+              match placement.value with
+              | Some(bounds, wp) ->
+                  let maximized = wp.showCmd = ShowWindowCommands.SW_SHOWMAXIMIZED
+                  let bounds = if maximized then bounds else this.applyExeMarginForWrite(hwnd, bounds)
+                  // Queue only the selected window. No per-monitor Sleep or
+                  // synchronous cross-process positioning on the drag path.
+                  if maximized then window.moveAsync(bounds)
+                  window.setPlacement({wp with flags = wp.flags ||| WindowPlacementFlags.WPF_ASYNCWINDOWPLACEMENT})
+                  if not maximized then window.moveAsync(bounds)
+              | None -> window.showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
 
     member private this.parkBackgroundWindows(active) =
         suppressFlashUntil <- DateTime.Now.AddSeconds(3.0)
@@ -444,6 +451,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                         pendingMinMaxEchoes.[(hwnd, WinEvent.EVENT_SYSTEM_MINIMIZEEND)] <- DateTime.Now
                         this.os.windowFromHwnd(hwnd).showWindowAsync(ShowWindowCommands.SW_SHOWNOACTIVATE)
             elif hwnd <> active && not(parkedBackground.Contains(hwnd)) then
+                let parked = this.os.windowFromHwnd(hwnd)
+                if parked.isFullscreen && not parked.isMaximized then fullscreenWindows.Add(hwnd) |> ignore
                 parkedBackground.Add(hwnd) |> ignore
                 if not(isMinimized hwnd) && backgroundTransitions.Add(hwnd) then
                     this.disableTransitions(hwnd)
@@ -505,7 +514,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             | Some(topHwnd) ->
                 let w = this.os.windowFromHwnd(topHwnd)
                 let b = w.bounds
-                w.isWindow && w.isMinimized.not && b.width > 0 && b.height > 0
+                w.isWindow && w.isMinimized.not && not(w.isFullscreen && not w.isMaximized) && b.width > 0 && b.height > 0
             | None -> false
         if topIsValid && not backgroundMinimizeEnabled then
             // This is the de-facto "restore follows the group" path: when the
@@ -542,7 +551,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
                 // Move all background windows again with the correct size
                 zorderCell.value.tail.iter(fun hwnd ->
                     let window = this.os.windowFromHwnd(hwnd)
-                    if window.isMinimized.not then
+                    if window.isMinimized.not && not(window.isFullscreen && not window.isMaximized) && not(fullscreenWindows.Contains(hwnd)) then
                         // Apply per-exe margin for this background window
                         let targetBounds =
                             if topMaximized then groupBounds
@@ -906,9 +915,13 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
         // degenerate bounds: GetWindowRect fails and yields (0,0,0,0). Never
         // save such a placement — it would later be applied to every other
         // window in the group.
+        if not window.isMinimized then
+            if window.isFullscreen && not window.isMaximized then fullscreenWindows.Add(hwnd) |> ignore
+            else fullscreenWindows.Remove(hwnd) |> ignore
         let liveBounds = window.bounds
         if  window.isWindow &&
             window.isMinimized.not &&
+            not(fullscreenWindows.Contains(hwnd)) &&
             liveBounds.width > 0 && liveBounds.height > 0 &&
             this.os.isOnScreen(liveBounds)
             then
@@ -1049,7 +1062,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
 
     member private this.adjustWindowPlacement(hwnd) =
         let window = this.os.windowFromHwnd(hwnd)
-        if placement.value.IsSome then
+        if placement.value.IsSome && not(fullscreenWindows.Contains(hwnd)) && not(window.isFullscreen && not window.isMaximized) then
             let bounds,wp = placement.value.Value
             // Skip per-exe margin when target is maximized: bounds already match the work rect.
             let targetMaximized = wp.showCmd = ShowWindowCommands.SW_SHOWMAXIMIZED
@@ -1485,6 +1498,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>) as this =
             hookCleanup.value.find(hwnd).Dispose()
             hookCleanup.map(fun hooks -> hooks.remove(hwnd))
             if backgroundTransitions.Remove(hwnd) then this.enableTransitions(hwnd)
+            fullscreenWindows.Remove(hwnd) |> ignore
             if parkedBackground.Remove(hwnd) && window.isWindow && not backgroundGroupMinimized then
                 this.restoreBackgroundWindow(hwnd)
             if backgroundActive = hwnd then

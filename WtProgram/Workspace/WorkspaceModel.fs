@@ -353,7 +353,7 @@ type WorkspaceModel() as this =
             let windows = windows.sortBy(fun w -> w?zorder).choose windowResolver.resolve
             
             windows.iter removeWindow
-            windows.iter <| fun hwnd -> WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_RESTORE).ignore
+            windows.iter <| fun hwnd -> WinUserApi.ShowWindowAsync(hwnd, ShowWindowCommands.SW_RESTORE).ignore
             Dpi.withUnawareContext <| fun() ->
                 windows.iter <| fun hwnd -> os.windowFromHwnd(hwnd).setPlacement(groupInfo?placement)
             os.setZorder(windows)

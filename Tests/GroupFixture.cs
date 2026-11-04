@@ -6,6 +6,8 @@ class GroupFixture {
   int positions;
   Form dialog;
   protected override void WndProc(ref Message m) {
+   if(m.Msg==0x8047) { System.Threading.Thread.Sleep(4000); return; }
+   if(m.Msg==0x8048) { FormBorderStyle=FormBorderStyle.None; Bounds=Screen.PrimaryScreen.Bounds; return; }
    if(m.Msg==0x8043) { Owner=m.WParam==IntPtr.Zero?null:Form.FromHandle(m.WParam) as Form; return; }
    if(m.Msg==0x8044) {
     BeginInvoke(new Action(()=>{

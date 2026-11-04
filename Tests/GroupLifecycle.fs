@@ -1,4 +1,4 @@
-﻿module GroupLifecycle
+module GroupLifecycle
 open System
 open System.Drawing
 open System.Diagnostics
@@ -57,8 +57,10 @@ let run (appearance:TabAppearanceInfo) =
         check (not(filter.isTabbableWindow(probe))) "off-screen probe unexpectedly discoverable"
         check (filter.isRetainableWindow(probe)) "parked existing window would be removed"
         probe.hide()
+        pump 100
         check (not(filter.isRetainableWindow(probe))) "tray-hidden window should still be removable"
         probe.showNoActivate()
+        pump 100
         values.["enableTabbingByDefault"] <- box false
         check (not(filter.isRetainableWindow(probe))) "explicit process exclusions ignored"
         values.["enableTabbingByDefault"] <- box true
@@ -420,6 +422,44 @@ let run (appearance:TabAppearanceInfo) =
                     pump 200
                     for h in allStress do (os.windowFromHwnd h).close()
                     if not(stress.WaitForExit(5000)) then stress.Kill()
+            group.windows.items.iter group.removeWindow
+            pump 200
+            let full = os.windowFromHwnd(handles.[0])
+            let normal = os.windowFromHwnd(handles.[1])
+            normal.showWindowAsync(ShowWindowCommands.SW_RESTORE)
+            normal.moveAsync(Rect(Pt(100,100),Sz(640,480)))
+            pump 300
+            group.addWindow(normal.hwnd,false)
+            pump 300
+            let normalBounds = group.placementBounds
+            WinUserApi.PostMessage(full.hwnd,0x8048,IntPtr.Zero,IntPtr.Zero) |> ignore
+            full.showWindowAsync(ShowWindowCommands.SW_RESTORE)
+            pump 300
+            check full.isFullscreen "fullscreen fixture not fullscreen"
+            group.addWindow(full.hwnd,false)
+            group.minimizeBackgroundTabs <- true
+            group.tabActivate(Tab(full.hwnd),true)
+            pump 400
+            group.tabActivate(Tab(normal.hwnd),true)
+            pump 400
+            check (group.placementBounds = normalBounds) "fullscreen contaminated group bounds"
+            group.tabActivate(Tab(full.hwnd),true)
+            pump 400
+            check full.isFullscreen "fullscreen window resized on tab return"
+            printfn "PASS fullscreen tab preserves monitor bounds and normal group placement"
+            group.windows.items.iter group.removeWindow
+            pump 300
+            WinUserApi.PostMessage(full.hwnd,0x8047,IntPtr.Zero,IntPtr.Zero) |> ignore
+            pump 100
+            let blockedWatch = Stopwatch.StartNew()
+            full.minimize()
+            full.restore()
+            full.move(Rect(Pt(100,100),Sz(500,300)))
+            full.insertAfter(WindowHandleTypes.HWND_TOP)
+            full.setPlacement(full.placement)
+            check (blockedWatch.ElapsedMilliseconds < 1000L) "unresponsive external window blocked caller"
+            pump 4200
+            printfn "PASS unresponsive external UI thread: show/move/z-order/placement return within 1 second"
         finally
             group.windows.items.iter group.removeWindow
             group.destroy()

@@ -219,11 +219,9 @@ type OS() as this=
                 SetWindowPosFlags.SWP_NOOWNERZORDER |||
                 SetWindowPosFlags.SWP_NOMOVE |||
                 SetWindowPosFlags.SWP_NOSIZE |||
-                SetWindowPosFlags.SWP_NOACTIVATE)
-                // NOTE: do not add SWP_ASYNCWINDOWPOS here — posting the
-                // repositions to each window's own thread loses the relative
-                // ordering of the batch, and the restored-window-to-front
-                // ordering silently breaks.
+                SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_ASYNCWINDOWPOS)
+                // Preserve explicit predecessor relationships without waiting
+                // for a foreign UI thread to process the batch.
         WinUserApi.EndDeferWindowPos(!hdswp).ignore
 
 
@@ -329,7 +327,9 @@ and
 
     member this.isMinimized = WinUserApi.IsIconic(hwnd)
 
-    member this.showWindow(cmd:int) = WinUserApi.ShowWindow(hwnd, cmd).ignore
+    member this.showWindow(cmd:int) =
+        if WinBaseApi.GetCurrentThreadId() = this.tid then WinUserApi.ShowWindow(hwnd, cmd).ignore
+        else WinUserApi.ShowWindowAsync(hwnd, cmd).ignore
 
     // Non-blocking show-state change: posts to the target window's thread and
     // returns immediately (ShowWindow waits for the app to process it, which
@@ -390,7 +390,7 @@ and
     member this.setPlacement wp =
         let mutable wpStruct = WINDOWPLACEMENT()
         wpStruct.length <- Marshal.SizeOf(wpStruct)
-        wpStruct.flags <- wp.flags
+        wpStruct.flags <- wp.flags ||| WindowPlacementFlags.WPF_ASYNCWINDOWPLACEMENT
         wpStruct.showCmd <- wp.showCmd
         wpStruct.ptMinPosition <- wp.ptMinPosition.POINT
         wpStruct.ptMaxPosition <- wp.ptMaxPosition.POINT
@@ -413,16 +413,16 @@ and
         else
             WinUserApi.SetForegroundWindow(hwnd).ignore
 
-    member this.minimize() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_MINIMIZE).ignore
+    member this.minimize() = this.showWindow(ShowWindowCommands.SW_MINIMIZE)
     
     member this.restore() = 
-        WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_RESTORE).ignore
+        this.showWindow(ShowWindowCommands.SW_RESTORE)
 
     member this.close() = WinUserApi.PostMessage(hwnd, WindowMessages.WM_SYSCOMMAND, IntPtr(SystemMenuCommandValues.SC_CLOSE), IntPtr.Zero).ignore
 
     member this.setForegroundOrRestore(force) =
         if this.isMinimized then
-            WinUserApi.ShowWindow(this.hwnd, ShowWindowCommands.SW_RESTORE).ignore
+            this.showWindow(ShowWindowCommands.SW_RESTORE)
         else 
             this.setForeground(force)
     
@@ -433,7 +433,7 @@ and
     member this.hasCapture = WinUserApi.GetCapture() = hwnd
 
     member this.bringToTop() = 
-        WinUserApi.BringWindowToTop(hwnd).ignore
+        this.insertAfter(WindowHandleTypes.HWND_TOP)
     
     member this.insertAfter(hwndInsertAfter:IntPtr) =
         WinUserApi.SetWindowPos(hwnd,
@@ -441,7 +441,7 @@ and
             SetWindowPosFlags.SWP_NOOWNERZORDER |||
             SetWindowPosFlags.SWP_NOMOVE |||
             SetWindowPosFlags.SWP_NOSIZE |||
-            SetWindowPosFlags.SWP_NOACTIVATE) |> ignore
+            SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
 
     // Async z-order insert (posted to this window's thread): place this window
     // directly behind hwndInsertAfter without waiting on the app. Used when
@@ -471,7 +471,7 @@ and
             SetWindowPosFlags.SWP_NOOWNERZORDER |||
             SetWindowPosFlags.SWP_NOMOVE |||
             SetWindowPosFlags.SWP_NOSIZE |||
-            SetWindowPosFlags.SWP_NOACTIVATE) |> ignore
+            SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
 
     member this.parent = os.windowFromHwnd(WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT))
 
@@ -480,7 +480,7 @@ and
             WinUserApi.SetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT, parent.hwnd).ignore
             this.insertAfter(parent.prevZorder)
 
-    member this.showNoActivate() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
+    member this.showNoActivate() = this.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
 
     member this.update(image:Img, location:Pt, alpha) =
         // Build a fresh bitmap with a transparent background and the rendered
@@ -507,7 +507,7 @@ and
     member this.updateLocation(location:Pt) =       
         Win32Helper.UpdateLayeredWindow(hwnd, location.Point)
 
-    member this.hide() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_HIDE) |> ignore
+    member this.hide() = this.showWindow(ShowWindowCommands.SW_HIDE)
 
     member this.destroy() = 
         WinUserApi.DestroyWindow(hwnd).ignore
@@ -530,13 +530,7 @@ and
                 Marshal.SizeOf(typeof<int>)) |> ignore
 
     member this.move (bounds:Rect) =
-        WinUserApi.MoveWindow(
-            hwnd,
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height,
-            true) |> ignore
+        this.moveAsync(bounds)
 
     member this.setPositionOnly (x:int) (y:int) =
         // Move position only without changing size to avoid DPI scaling
@@ -547,7 +541,7 @@ and
             y,
             0,
             0,
-            SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER) |> ignore
+            SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
 
     // Position + size change posted to the target window's thread instead of
     // waiting on it. Safe where z-order is not being changed (SWP_NOZORDER):

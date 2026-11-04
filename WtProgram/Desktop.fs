@@ -219,7 +219,7 @@ type Desktop(notify:IDesktopNotification) as this =
                     adjustedY,
                     finalWidth,
                     finalHeight,
-                    SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER) |> ignore
+                    SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
             else
                 // Move window position only
                 window.setPositionOnly adjustedX adjustedY
